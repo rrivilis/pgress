@@ -138,7 +138,7 @@ The closest competitor is **Salsa** (rust-analyzer): also incremental, also DAG-
 
 - Small graphs under light load. The ISA dispatch, partition registry, and authority model carry constant-factor overhead. A 5-node graph with one writer will be faster in a HashMap. The amplification advantage emerges at scale in dense fan-in, high update rates, mixed eager/lazy topologies.
 
-- Concurrent access. `Graph` is not thread-safe. If you need multiple writers or parallel reads without external serialization, pgress is not the right primitive in its current form.
+- Concurrent access. `Graph` is not thread-safe as of now. pgress currently assumes serialized graph mutation. Multi-writer concurrency, lock-free reads, and distributed graph ownership are not part of the execution model currently.
 
 ---
 
