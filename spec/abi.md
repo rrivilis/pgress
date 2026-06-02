@@ -17,7 +17,7 @@
 | Opcode ≠ feature level | Older runtimes can skip unknown opcodes without mis-parsing |
 | Canonical encoding | Identical ISA sequences produce identical byte streams; replay is deterministic at two granularities — total order within each partition (`stream_seq`), partial order across partitions (edge-interaction causality) |
 | Explicit handles | All node/edge identity via opaque u64 Uid; no raw pointers cross the boundary |
-| No language assumptions | Pure C layout; no vtables, no ARC, no GC roots |
+| No language assumptions | No vtables, no ARC, no GC roots |
 | Observable convergence | Scheduling and interleaving may vary internally; externally observable node interpretations must converge identically across runtimes and schedulers |
 
 ---
@@ -772,5 +772,4 @@ Implementations MUST:
 
 The C/Zig function signatures for `pgress_apply`, `pgress_drain`, and related calls are
 provisional. They will be frozen once ≥2 independent consumers (e.g. Python SDK and
-a Zig client) have stress-tested the boundary. Provisional signatures are in
-`substrate/src/ffi.h` (not yet written).
+a Zig client) have stress-tested the boundary. 
