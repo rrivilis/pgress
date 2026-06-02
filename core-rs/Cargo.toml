@@ -1,0 +1,34 @@
+[package]
+name    = "pgress-core"
+version = "0.1.0"
+edition = "2021"
+description = "pgress: persistent graph rewriting substrate — Rust core"
+
+[dependencies]
+# Persistent / structural-sharing collections
+im = "15"
+
+# E-graph equivalence saturation (Reflection / stabilize mode)
+egg = "0.9"
+
+# UIDs
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+# Error handling
+thiserror = "1"
+
+# Fast hashing (FxHashMap/FxHashSet where perf matters)
+rustc-hash = "2"
+
+# Small inline vecs (dependency lists are usually short)
+smallvec = { version = "1", features = ["const_generics"] }
+
+[dev-dependencies]
+# Property-based testing against the Lean-verified algebra
+proptest = "1"
+# Benchmark harness
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "amplification"
+harness = false

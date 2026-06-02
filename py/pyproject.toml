@@ -1,0 +1,14 @@
+[build-system]
+requires      = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name        = "pygress"
+version     = "0.1.0"
+description = "pgress — persistent reactive graph substrate"
+requires-python = ">=3.9"
+
+[tool.maturin]
+features        = ["pyo3/extension-module"]
+python-packages = ["pygress"]
+module-name     = "pygress._pygress"

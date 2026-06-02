@@ -1,0 +1,3 @@
+[workspace]
+members  = ["core-rs", "py", "session-rs"]
+resolver = "2"

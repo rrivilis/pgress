@@ -1,0 +1,11 @@
+[package]
+name        = "pgress-session"
+version     = "0.1.0"
+edition     = "2021"
+description = "pgress session manager — domain hierarchy, auth gate, admission, telemetry"
+
+[dependencies]
+pgress-core = { path = "../core-rs" }
+rustc-hash  = "2"
+thiserror   = "1"
+smallvec    = { version = "1", features = ["const_generics"] }

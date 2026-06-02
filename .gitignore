@@ -1,0 +1,29 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pdb
+*.so
+
+# Node / frontend
+dist/
+.parcel-cache/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+

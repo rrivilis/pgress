@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>pgress demo</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      body { background: #0f172a; font-family: monospace; }
+
+      /* Suppress React Flow node selection ring without blocking pointer-events */
+      .react-flow__node.selected > div,
+      .react-flow__node:focus   > div { outline: none; box-shadow: none; }
+
+      /*
+       * Node fire animation — triggered when a node's value changes.
+       * --pc (pulse color) is set inline by TernaryNode and matches the
+       * node's current ternary value color.
+       */
+      @keyframes node-fire {
+        0%   {
+          transform:  scale(1);
+          box-shadow: 0 0 0 0px var(--pc, #7dd3fc),
+                      0 0  0px 0px var(--pc, #7dd3fc);
+        }
+        28%  {
+          transform:  scale(1.05);
+          box-shadow: 0 0 0 4px var(--pc, #7dd3fc),
+                      0 0 18px 2px color-mix(in srgb, var(--pc, #7dd3fc) 50%, transparent);
+        }
+        100% {
+          transform:  scale(1);
+          box-shadow: 0 0 0 0px var(--pc, #7dd3fc),
+                      0 0  0px 0px var(--pc, #7dd3fc);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

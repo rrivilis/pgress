@@ -1,0 +1,17 @@
+[package]
+name    = "pgress-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name       = "pygress"
+crate-type = ["cdylib"]
+
+[dependencies]
+pgress-core = { path = "../core-rs" }
+pyo3        = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = "symbols"
