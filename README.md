@@ -1,6 +1,6 @@
 # pgress
 
-**pgress is a distributed runtime designed to actively suppress redundant computational work by tracking causal dependencies between observable state changes. Instead of recomputing everything when data changes, it tracks what actually depends on what and only propagates meaningful updates.**
+**pgress is a reactive runtime designed to actively suppress redundant computational work by tracking causal dependencies between observable state changes. Instead of recomputing everything when data changes, it tracks what actually depends on what and only propagates meaningful updates.**
 
 - Same-value writes cost ~90 ns and trigger nothing downstream — enforced by construction, not convention.
 - A 500-input convergence fires the output exactly once (1.0× amplification vs 500× for Kafka).
@@ -23,9 +23,9 @@ work_amplification = total_recomputations / effective_updates
 | RxJS / reactive chain | ≈ D — every change traverses the full chain |
 | pgress | **≈ 1.0×** — output fires iff value changes; Zero/Pending suppress downstream |
 
-The amplification gap is not just a performance issue. At scale, whether dealing with AI inference pipelines or real-time collaborative systems, recomputation determines whether the system is tractable at all. Existing systems still incur the cost of recomputation once dependencies are reconstructed indirectly. Data centers running LLM query throughput pay this cost continuously. 
+The amplification gap is not just a performance issue. In any system that maintains derived state, recomputation cost determines whether the system stays tractable as it grows. Most systems pay it indirectly, reconstructing dependencies they threw away rather than tracking them up front.
 
-Naive answers are expensive at scale, whether you are running AI inference pipelines, real-time collaborative systems, or network routing. pgress approaches the problem by making the dependency graph structure the primary computational artifact: there is no separate "change detection" layer. Every recomputation is gated by a formal test of whether it would produce a new observable value.
+Naive answers are expensive at scale for any pipeline with derived state that has to reconcile multiple sources that can legitimately disagree: policy and config systems, multi-source data validation, anywhere last-write-wins silently destroys a conflict a human needed to see. pgress approaches the problem by making the dependency graph structure the primary computational artifact: there is no separate "change detection" layer. Every recomputation is gated by a formal test of whether it would produce a new observable value.
 
 ---
 
