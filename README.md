@@ -113,7 +113,7 @@ An 80%-Lazy graph produces 97% fewer recomputations than a fully reactive baseli
 
 ## What distinguishes this from existing models
 
-| Model | What it gets right | What it misses |
+| Model | What it gets right | Where it differs |
 |---|---|---|
 | **Kafka** | Durable message ordering | No dependency graph; amplification = fan-out; recomputes everything |
 | **Kubernetes** | Declarative reconciliation | Level-triggered; full reconcile per event; no ternary; no ISA |
@@ -125,6 +125,20 @@ An 80%-Lazy graph produces 97% fewer recomputations than a fully reactive baseli
 | **Actor model** | Concurrency isolation | Process-centric; no persistent substrate; no shared graph |
 
 The closest competitor is **Salsa** (rust-analyzer): also incremental, also DAG-aware, also skips recomputation when inputs are unchanged. The difference: Salsa is a compiler cache, modeling a static DAG over pure functions. pgress is a dynamic attributed graph that can be rewritten at runtime, supports non-monotone operations (Lazy, Reflect), handles structural conflicts via e-graph saturation, distributes across partition boundaries with causal consistency, and carries formal information-flow authority on every dependency edge.
+
+## When not to use pgress
+
+- Every event is independently meaningful. If downstream consumers need to process each individual message (e.g. financial tick data, audit logs, ordered command streams) then suppressing same-value writes is wrong. Use Kafka or a message queue; pgress is designed to discard redundancy, not preserve it.
+
+- No derived state. If your system is mostly reads and writes with no computed dependencies between values, you don't need a dependency graph. A database with indexes will do less work with less overhead.
+
+- Static DAG, pure functions, no runtime rewrites. If your dependency graph is fixed at compile time and never mutated, Salsa or a memoization cache is simpler and has lower operational surface area. pgress is designed for graphs that change shape at runtime. if yours doesn't, that design is overhead you'll never recover.
+
+- You need a clean boolean false. pgress has no value meaning plain "false/off." Absence is None (`Neg`), which suspends downstream evaluation rather than propagating; False (`Zero`) means contested (infectious, self-negating), and is structurally unlike "no." Code that reaches for False expecting "off" triggers conflict propagation instead. If your domain needs an asserted negative that behaves like an ordinary boolean, the ternary model fights you at every turn.
+
+- Small graphs under light load. The ISA dispatch, partition registry, and authority model carry constant-factor overhead. A 5-node graph with one writer will be faster in a HashMap. The amplification advantage emerges at scale in dense fan-in, high update rates, mixed eager/lazy topologies.
+
+- Concurrent access. `Graph` is not thread-safe. If you need multiple writers or parallel reads without external serialization, pgress is not the right primitive in its current form.
 
 ---
 
