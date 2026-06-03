@@ -1,0 +1,124 @@
+* rtl/spice/t_class.spice
+*
+* T_CLASS — ternary slot classifier
+*
+* Function:
+*   Takes {p0, p1} (2-bit ternary encoding) and produces three one-hot flags:
+*     is_neg  = ~p0 & ~p1   (NOR2)
+*     is_zero = ~p0 &  p1   (AND2 using shared ~p0)
+*     is_pos  =  p0 & ~p1   (AND2 using shared ~p1)
+*
+* Note: {p0=1, p1=1} is DC (don't-care) — unused in pgress encoding.
+*       is_neg + is_zero + is_pos = 1 for all valid inputs.
+*
+* Sky130 cell instantiation:
+*   is_neg  : sky130_fd_sc_hd__nor2_1    (NOR(p0, p1) = ~p0 & ~p1)
+*   inv_p0  : sky130_fd_sc_hd__inv_1     (shared ~p0 for is_neg, is_zero)
+*   inv_p1  : sky130_fd_sc_hd__inv_1     (shared ~p1 for is_neg, is_pos)
+*   is_zero : sky130_fd_sc_hd__and2_0    (AND(inv_p0, p1))
+*   is_pos  : sky130_fd_sc_hd__and2_0    (AND(p0, inv_p1))
+*   Total: 5 cells, ~20 transistors
+*
+* Measurements:
+*   tpd_neg   : propagation delay p0/p1 → is_neg  (critical: NOR path)
+*   tpd_zero  : propagation delay p0/p1 → is_zero (through INV + AND)
+*   tpd_pos   : propagation delay p0/p1 → is_pos  (through INV + AND)
+*   power_active : average VDD current during stimulus
+*
+* Expected:
+*   tpd_neg  ~0.05 ns (NOR2 direct path, sky130 HD)
+*   tpd_zero ~0.10 ns (INV + AND2, two gate levels)
+*   tpd_pos  ~0.10 ns (INV + AND2, two gate levels)
+*   This sets the floor for the full N-input ternary_cell critical path.
+
+.title T_CLASS ternary slot classifier — sky130_fd_sc_hd
+
+* ── PDK include ──────────────────────────────────────────────────────────────
+* Adjust PDK_ROOT to your sky130 installation.
+* Options:
+*   volare:   $HOME/.volare/sky130A/libs.ref/sky130_fd_sc_hd/spice/
+*   open_pdks: /usr/local/share/pdk/sky130A/libs.ref/sky130_fd_sc_hd/spice/
+*   pip sky130: see `python3 -c "import sky130; print(sky130.PDK_ROOT)"`
+.include "$PDK_ROOT/sky130_fd_sc_hd.spice"
+
+* ── Supply ───────────────────────────────────────────────────────────────────
+.param VDD=1.8
+Vvdd VDD 0 DC 'VDD'
+Vvss VSS 0 DC 0
+
+* ── DUT ──────────────────────────────────────────────────────────────────────
+* Shared inversions (reused by two downstream AND cells each)
+Xinv_p0  p0 inv_p0  VDD VSS sky130_fd_sc_hd__inv_1
+Xinv_p1  p1 inv_p1  VDD VSS sky130_fd_sc_hd__inv_1
+
+* is_neg = NOR(p0, p1) = ~p0 & ~p1
+Xnor2    p0 p1 is_neg  VDD VSS sky130_fd_sc_hd__nor2_1
+
+* is_zero = AND(~p0, p1)
+Xand_zero  inv_p0 p1 is_zero  VDD VSS sky130_fd_sc_hd__and2_0
+
+* is_pos = AND(p0, ~p1)
+Xand_pos   p0 inv_p1 is_pos   VDD VSS sky130_fd_sc_hd__and2_0
+
+* ── Stimulus ─────────────────────────────────────────────────────────────────
+* Step through all valid ternary inputs:
+*   0–5 ns:   Neg  {p0=0, p1=0}  → expect is_neg=1, is_zero=0, is_pos=0
+*   5–10 ns:  Pos  {p0=1, p1=0}  → expect is_neg=0, is_zero=0, is_pos=1
+*   10–15 ns: Zero {p0=0, p1=1}  → expect is_neg=0, is_zero=1, is_pos=0
+*   15–20 ns: Neg  {p0=0, p1=0}  → back to Neg
+*   20–25 ns: Zero {p0=0, p1=1}  → Zero again (recovery)
+*   25–30 ns: Pos  {p0=1, p1=0}  → Pos recovery
+*
+* Rise/fall = 10 ps (sky130 HD typical slew)
+Vp0 p0 0 PWL(
++  0ns   0
++  5ns   0
++  5.01ns 'VDD'
++ 10ns   'VDD'
++ 10.01ns 0
++ 15ns   0
++ 20ns   0
++ 25ns   0
++ 25.01ns 'VDD'
++ 30ns   'VDD')
+
+Vp1 p1 0 PWL(
++  0ns   0
++  10ns  0
++  10.01ns 'VDD'
++ 15ns  'VDD'
++ 15.01ns 0
++ 20ns  0
++ 20.01ns 'VDD'
++ 25ns  'VDD'
++ 25.01ns 0
++ 30ns  0)
+
+* ── Simulation ───────────────────────────────────────────────────────────────
+.tran 1ps 30ns
+
+* ── Measurements ─────────────────────────────────────────────────────────────
+* Propagation delay: p0 0→1 at t=5ns → is_pos should rise
+.measure tran tpd_pos TRIG v(p0) VAL='VDD/2' RISE=1 TD=4ns
++                     TARG v(is_pos) VAL='VDD/2' RISE=1
+
+* Propagation delay: p1 0→1 at t=10ns → is_zero should rise
+.measure tran tpd_zero TRIG v(p1) VAL='VDD/2' RISE=1 TD=9ns
++                      TARG v(is_zero) VAL='VDD/2' RISE=1
+
+* Propagation delay: p0 1→0 at t=10ns → is_neg should rise (NOR direct path)
+.measure tran tpd_neg TRIG v(p0) VAL='VDD/2' FALL=1 TD=9ns
++                     TARG v(is_neg) VAL='VDD/2' RISE=1
+
+* Average power (full transient)
+.measure tran power_avg AVG POWER FROM=0ns TO=30ns
+
+* ── Output ───────────────────────────────────────────────────────────────────
+.print tran v(p0) v(p1) v(is_neg) v(is_zero) v(is_pos)
+.control
+  run
+  plot v(p0) v(p1) v(is_neg) v(is_zero) v(is_pos)
+  print tpd_neg tpd_zero tpd_pos power_avg
+.endc
+
+.end

@@ -381,7 +381,7 @@ Clock: 4 ns period (250 MHz). All RTL numbers are cycle-exact Verilator simulati
 
 No-op at zero cost is structural, not a run-time optimization: clock-enable suppression (`ce = comb_out != out`) prevents the output register from toggling when the combinational result matches the stored value. This is the direct hardware analogue of Opt 7 (same-value early exit) and Opt 12 (dep-counter shortcut).
 
-Hot-toggle speed difference (920×) reflects the gap between one clocked register update and a full Rust tick: queue drain, dep-counter update, causal epoch increment, and subscriber loop. The RTL path has none of these — it is the fixed-point rule directly materialized in silicon.
+Hot-toggle speed difference (920×) reflects the gap between one clocked register update and a full Rust tick: queue drain, dep-counter update, causal epoch increment, and subscriber loop. The RTL path has none of these because the fixed-point rule is directly materialized in silicon.
 
 ### Topology stabilization — chain and tree (tb_topology)
 
@@ -421,7 +421,7 @@ The key property demonstrated by the RTL results: **stabilization latency is a d
 | L-level FANOUT-ary tree | L | One register per level; change propagates at 1 level/cycle |
 | General DAG, critical path D | D | One register per edge hop on the longest path |
 
-For a `CompiledRegion` with critical path depth D, the RTL stabilization latency is exactly `D × T_clock`. This matches the final-coalgebra framing: the hardware backend is a morphism into the same ternary fixed-point algebra, and the software oracle and hardware fabric must agree on the quiescent state — not on intermediate cycles.
+For a `CompiledRegion` with critical path depth D, the RTL stabilization latency is exactly `D × T_clock`. The hardware backend maps into the same ternary fixed-point algebra, and the software oracle and hardware fabric must agree on the quiescent state. 
 
 **Quiescent-state equivalence** is the hardware correctness criterion: for every region R and input vector v, the RTL fabric reaches the same ternary fixed point as `run_compiled_region` on the software engine. The RTL simulation confirms this for all 12 tested scenarios.
 
@@ -438,6 +438,6 @@ Same RTL, different clock target. CGRA cells are coarse-grained and operate at h
 CGRA is the preferred materialized fabric target over ASIC because:
 - **Dynamic topology**: routing reconfiguration matches pgress's dynamic region rewrites; ASIC requires re-synthesis.
 - **Granularity match**: coarse-grained CGRA cells map 1:1 to `ternary_cell` instances; no LUT decomposition overhead.
-- **Host split**: Stabilize, egg e-graph saturation, and Demand remain on the host CPU — CGRA handles the hot SpMV path only. CGRA reconfigurability preserves this split at runtime.
+- **Host split**: Stabilize, egg e-graph saturation, and Demand remain on the host CPU. CGRA handles the hot SpMV path only. CGRA reconfigurability preserves this split at runtime.
 
 Speedup ratios hold at all targets because software costs (queue drain, causal tick, dep-counter update) do not scale with clock frequency.

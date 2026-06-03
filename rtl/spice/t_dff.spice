@@ -1,0 +1,117 @@
+* rtl/spice/t_dff.spice
+*
+* T_DFF — ternary D flip-flop with clock enable and synchronous reset
+*
+* Yosys cell: $_SDFFE_PP0P_
+*   Positive clock edge, positive reset-to-0, positive clock enable.
+*
+* Implementation (sky130):
+*   Bit p0: mux2_1 (A=Q_p0, B=D_p0, S=CE) → D_eff_p0 → dfrtp_1(CLK, D_eff_p0, RST_B) → Q_p0
+*   Bit p1: mux2_1 (A=Q_p1, B=D_p1, S=CE) → D_eff_p1 → dfrtp_1(CLK, D_eff_p1, RST_B) → Q_p1
+*   RST_B = ~RST (sky130 dfrtp has active-low reset)
+*   Total: 2x mux2_1 + 2x dfrtp_1 + 1x inv_1 (for RST_B) = 5 cells, ~30 transistors
+*
+* Measurements (three scenarios):
+*
+*   Scenario A — Active toggling (CE=1, data changes every 4 ns / 250 MHz):
+*     power_active: VDD current when the DFF toggles every cycle.
+*
+*   Scenario B — Same-value suppression (CE=1, data == stored, no toggle):
+*     power_ce_suppressed: VDD current when comb_out == out (ce=0 at the
+*     ternary_cell level). Here we force CE=0 to simulate what ternary_cell
+*     does when the reduction produces the same result as the stored value.
+*     Expected: near-zero dynamic power (only the MUX SE path switches).
+*
+*   Scenario C — CE=0 quiescent (DFF and MUX both idle):
+*     Identical to B but driven explicitly. Confirms that the MUX's A input
+*     (Q feedback) does not cause ripple on the DFF D input when S=0.
+*
+* Key result: power_active / power_ce_suppressed ratio characterizes the
+* dynamic power savings of same-value suppression at transistor level.
+* This is the hardware proof of Opt 7 (same-value early exit) and the
+* RTL clock-enable suppression (`ce = comb_out != out`).
+
+.title T_DFF ternary register with CE — sky130_fd_sc_hd
+
+.include "$PDK_ROOT/sky130_fd_sc_hd.spice"
+
+.param VDD=1.8
+Vvdd VDD 0 DC 'VDD'
+Vvss VSS 0 DC 0
+
+* ── DUT ──────────────────────────────────────────────────────────────────────
+* RST_B = active-low reset (dfrtp convention); RST is our active-high input.
+Xinv_rst RST RST_B VDD VSS sky130_fd_sc_hd__inv_1
+
+* Bit p0 (p0 output bit, encoding bit 0)
+Xmux_p0  Q_p0 D_p0 CE D_eff_p0  VDD VSS sky130_fd_sc_hd__mux2_1
+Xdff_p0  CLK D_eff_p0 RST_B Q_p0  VDD VSS sky130_fd_sc_hd__dfrtp_1
+
+* Bit p1 (p1 output bit, encoding bit 1)
+Xmux_p1  Q_p1 D_p1 CE D_eff_p1  VDD VSS sky130_fd_sc_hd__mux2_1
+Xdff_p1  CLK D_eff_p1 RST_B Q_p1  VDD VSS sky130_fd_sc_hd__dfrtp_1
+
+* ── Parameters ───────────────────────────────────────────────────────────────
+.param TCLK=4ns     ; 250 MHz
+.param TRESET=2ns   ; reset pulse width
+.param TSETUP=0.2ns ; data setup before clock edge
+
+* ── Stimulus ─────────────────────────────────────────────────────────────────
+* Clock (250 MHz, 50% duty cycle)
+VCLK CLK 0 PULSE(0 'VDD' 0 10ps 10ps '(TCLK/2)-10ps' 'TCLK')
+
+* Reset: assert for first 2 cycles, then deassert
+VRST RST 0 PWL(0 'VDD'  'TRESET' 'VDD'  'TRESET+0.01ns' 0  200ns 0)
+
+* ── Scenario A (0–60 ns): CE=1, data toggles Neg↔Pos at 250 MHz ─────────────
+* Neg = {p0=0, p1=0}, Pos = {p0=1, p1=0}
+* Hot-toggle: mimics the hot_toggle_zero_pos benchmark at the register level.
+* CE is held high; D_p0 toggles each cycle; D_p1 stays low (Neg↔Pos only).
+VCE CE 0 PWL(
++  0       'VDD'    ; CE=1: enabled throughout Scenario A and B
++ 80ns    'VDD'
++ 80.01ns  0        ; CE=0: scenario C (explicit quiescent)
++ 120ns    0)
+
+VD_p0 D_p0 0 PULSE('VDD' 0 'TRESET+TCLK-TSETUP' 10ps 10ps
++                   '(TCLK/2)-10ps' 'TCLK')
+
+; D_p1 stays 0 throughout (Neg and Pos both have p1=0)
+VD_p1 D_p1 0 DC 0
+
+* ── Simulation ───────────────────────────────────────────────────────────────
+.tran 1ps 120ns
+
+* ── Measurements ─────────────────────────────────────────────────────────────
+* Scenario A: active toggling power (CE=1, data changes every cycle)
+*   Measure from t=4ns (after reset) to t=60ns (15 clock cycles)
+.measure tran power_active AVG POWER FROM=4ns TO=60ns
+
+* Scenario B: CE=1 but data matches stored (D == Q, no actual toggle)
+*   Measure from t=60ns to t=80ns — at this point Q_p0 has settled to 0 and
+*   D_p0 has also settled to 0, so CE=1 but no output change.
+*   This simulates ternary_cell with same-value input (ce=0 emerging from logic,
+*   but here CE pin is still 1 — the MUX selects A=Q anyway since D==Q).
+*
+*   NOTE: this scenario measures the MUX+DFF overhead when D==Q and CE=1.
+*   In the full ternary_cell design, CE is driven to 0 before this point,
+*   so the actual cell is even quieter (scenario C below).
+.measure tran power_ce_data_matches AVG POWER FROM=60ns TO=80ns
+
+* Scenario C: CE=0 explicitly — full quiescence
+*   (CE pin driven low at t=80ns, see VCE above)
+.measure tran power_ce_zero AVG POWER FROM=84ns TO=120ns
+
+* ── Output ───────────────────────────────────────────────────────────────────
+.print tran v(CLK) v(CE) v(D_p0) v(Q_p0) v(Q_p1)
+.control
+  run
+  plot v(CLK) v(D_p0) v(Q_p0) v(CE)
+  print power_active power_ce_data_matches power_ce_zero
+  echo "--- Power ratio active/ce_suppressed:"
+  let ratio_a_b = power_active / power_ce_data_matches
+  let ratio_a_c = power_active / power_ce_zero
+  print ratio_a_b ratio_a_c
+.endc
+
+.end

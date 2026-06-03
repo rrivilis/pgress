@@ -1,0 +1,71 @@
+# rtl/syn/synth_ternary_cell.ys
+#
+# Yosys synthesis script for ternary_cell (generic gate library).
+#
+# Produces:
+#   - Cell counts and wire counts (stat)
+#   - Logical depth of critical path (tee -q into abc -liberty with no liberty = generic)
+#   - Fanout report on key internal signals
+#   - Synthesized netlist for gate-level Verilator sim or further analysis
+#
+# Run from pgress/ root:
+#   yosys rtl/syn/synth_ternary_cell.ys
+#
+# For N=500 MeetAll the critical path is:
+#   inputs[2k]/inputs[2k+1]
+#     -> per-slot classifier (1 gate)
+#     -> 500-input OR tree (ceil(log2(500)) = 9 binary OR levels)
+#     -> priority mux (1-2 levels)
+#     -> ce comparison (1 level)
+#     -> DFF setup
+# Expected logical depth: ~12 gate levels.
+
+# ── Read design ──────────────────────────────────────────────────────────────
+read_verilog -sv rtl/sv/ternary_cell.sv
+
+# Elaborate with N=500, RULE=0 (MeetAll) — primary target
+hierarchy -top ternary_cell -chparam N 500 -chparam RULE 0
+
+# ── Synthesis (technology-independent) ───────────────────────────────────────
+# flatten: inline all submodules into one flat netlist
+# proc:    convert always blocks to netlists
+# opt:     constant folding, unreachable logic removal
+# fsm:     finite state machine extraction (none expected here)
+# memory:  memory inference (none)
+# techmap: map to generic cells (AND, OR, NOT, MUX, DFF, etc.)
+synth -top ternary_cell -flatten
+
+# ── Statistics ────────────────────────────────────────────────────────────────
+# Reports: number of cells by type, wire count, input/output ports.
+tee -q -o rtl/syn/stat_n500_meetall.txt stat -top ternary_cell
+
+# ── Critical path analysis (ABC) ─────────────────────────────────────────────
+# abc -liberty requires a liberty file for real timing.
+# Without one, use -lut 6 (6-input LUT model, approximates FPGA) and -dff
+# to estimate LUT depth. The 'print_stats' command shows level count.
+tee -q -o rtl/syn/abc_n500_meetall.txt abc -lut 6 -dff
+
+# After LUT mapping, stat again to see LUT count and level estimate.
+tee -q -a rtl/syn/abc_n500_meetall.txt stat -top ternary_cell
+
+# ── Write synthesized netlist ─────────────────────────────────────────────────
+# Generic Verilog netlist for gate-level simulation or further analysis.
+write_verilog -noattr rtl/syn/netlist_n500_meetall.v
+
+# ── Also synthesize N=4 (RULE=0) for comparison — the minimal cell ───────────
+read_verilog -sv rtl/sv/ternary_cell.sv
+hierarchy -top ternary_cell -chparam N 4 -chparam RULE 0
+synth -top ternary_cell -flatten
+tee -q -o rtl/syn/stat_n4_meetall.txt stat -top ternary_cell
+tee -q -a rtl/syn/stat_n4_meetall.txt abc -lut 6 -dff
+tee -q -a rtl/syn/stat_n4_meetall.txt stat -top ternary_cell
+write_verilog -noattr rtl/syn/netlist_n4_meetall.v
+
+# ── Also synthesize N=500, RULE=1 (JoinAny) for comparison ───────────────────
+read_verilog -sv rtl/sv/ternary_cell.sv
+hierarchy -top ternary_cell -chparam N 500 -chparam RULE 1
+synth -top ternary_cell -flatten
+tee -q -o rtl/syn/stat_n500_joinany.txt stat -top ternary_cell
+tee -q -a rtl/syn/stat_n500_joinany.txt abc -lut 6 -dff
+tee -q -a rtl/syn/stat_n500_joinany.txt stat -top ternary_cell
+write_verilog -noattr rtl/syn/netlist_n500_joinany.v
