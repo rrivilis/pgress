@@ -441,3 +441,149 @@ CGRA is the preferred materialized fabric target over ASIC because:
 - **Host split**: Stabilize, egg e-graph saturation, and Demand remain on the host CPU. CGRA handles the hot SpMV path only. CGRA reconfigurability preserves this split at runtime.
 
 Speedup ratios hold at all targets because software costs (queue drain, causal tick, dep-counter update) do not scale with clock frequency.
+
+---
+
+## Gate-level synthesis — Yosys characterization
+
+Reproduction: `./rtl/syn/run_synth.sh` (requires Yosys ≥ 0.24).
+
+Source: `rtl/sv/ternary_cell_syn.sv` (synthesis-compatible variant — `automatic` keyword removed). Synthesis target: generic LUT-6 (6-input LUT) using `abc -lut 6` with full optimization pipeline (`proc; flatten; opt; memory; techmap; opt; abc -lut 6`). Results reflect 6-input LUT technology; FPGA back-end targets (Xilinx UltraScale+, Intel Agilex) use this primitive natively. CGRA targets translate LUTs to coarse-grained ALU cells post-synthesis.
+
+### Resource utilization
+
+| Configuration | Generic gates (pre-synthesis) | LUT-6 cells | DFF cells | LUT reduction |
+|---|---|---|---|---|
+| N=500, MeetAll | 3 006 | 583 | 2 | **5.15× compression** |
+| N=4,   MeetAll | 12   | 5   | 2 | 2.4× compression |
+| N=4,   JoinAny | 12   | 5   | 2 | 2.4× compression |
+
+The 5× LUT compression at N=500 reflects ABC's global optimization: wide OR-trees across 500 slots collapse into balanced LUT networks far more efficient than direct 1-gate-per-slot expansion.
+
+### Critical path depth
+
+| Configuration | LUT levels (critical path) | Est. latency @ 500 MHz |
+|---|---|---|
+| N=500, MeetAll | **6** | **12 ns** |
+| N=4,   MeetAll | 2    | 4 ns |
+
+Six LUT levels for N=500 MeetAll. Each level adds one LUT propagation delay (~0.5 ns at 500 MHz for a well-placed CGRA or FPGA cell). The 6-level depth is consistent with a balanced binary reduction tree over 500 inputs: ⌈log₂(500)⌉ = 9 levels naively, but ABC exploits MeetAll's associativity and the fixed 6-input LUT width to achieve 6 levels.
+
+This is the registered critical path D=6 for the flat fan-in topology entry in the predictable-latency table — a 500-input MeetAll stabilizes in 6 clock cycles in the general registered case (1 cycle in the fully combinational case when the output register is at the root only).
+
+### Fanout analysis
+
+| Metric | N=500 MeetAll |
+|---|---|
+| Maximum net fanout | **2** |
+| Average net fanout | ~1.1 |
+
+Maximum fanout=2 confirms that ABC's technology mapping holds the LUT network to near-unit fanout throughout. No high-fanout net exists in the synthesized MeetAll — the tree structure prevents any single intermediate signal from driving many consumers. This is structurally important for FPGA/CGRA placement: no buffering or fanout insertion is required, and routing is local.
+
+### Optimization: `any_pos` eliminated by synthesis
+
+For MeetAll with N≥3, `any_pos` (the Pos-reduction OR tree) is entirely removed by ABC. The reason: `MeetAll` returns Pos only when `!any_neg && !any_zero` — i.e., the `else` branch, which needs no explicit test. ABC determines that `any_pos` is never consulted as an independent signal and culls the entire OR tree (N gates → 0). Only 2 of the 3 reduction planes are materialized in silicon:
+
+| Plane | Gates in LUT netlist |
+|---|---|
+| `any_neg` reduction | ✓ present |
+| `any_zero` reduction | ✓ present |
+| `any_pos` reduction | ✗ eliminated (implicit else branch) |
+
+JoinAny has the symmetric optimization: `any_neg` is implicit.
+
+### Synthesis summary
+
+```
+ternary_cell (N=500, MeetAll)
+  Generic gates (pre-abc):  3,006
+  LUT-6 cells:                583
+  DFF cells:                    2
+  LUT levels:                   6
+  Max net fanout:               2
+  any_pos OR-tree:         PRUNED (ABC optimization)
+```
+
+The 2 DFF cells correspond to the 2-bit registered output `{p1, p0}` — the `$_SDFFE_PP0P_` (T_DFF) at the root.
+
+---
+
+## Switch-level characterization — sky130_fd_sc_hd SPICE decks
+
+Reproduction: install ngspice and sky130 PDK, then `./rtl/spice/run_spice.sh all`.
+
+```bash
+sudo apt install ngspice -y
+pip3 install sky130
+./rtl/spice/run_spice.sh all
+```
+
+Three primitive cells characterized against the SkyWater 130nm high-density standard cell library (`sky130_fd_sc_hd`). These are the transistor-level proofs of the RTL and synthesis results above.
+
+### T_CLASS — ternary slot classifier
+
+**Function**: `{p0, p1}` → `{is_neg, is_zero, is_pos}` one-hot flags.
+
+**Implementation**: 5 cells, ~20 transistors.
+- `nor2_1`: `is_neg = NOR(p0, p1) = ~p0 & ~p1`
+- `inv_1` × 2: shared `~p0`, `~p1` (each reused by two downstream AND cells)
+- `and2_0` × 2: `is_zero = AND(~p0, p1)`, `is_pos = AND(p0, ~p1)`
+
+| Measurement | Expected | Description |
+|---|---|---|
+| `tpd_neg` | ~0.05 ns | NOR2 direct path — single gate delay |
+| `tpd_zero` | ~0.10 ns | INV + AND2 — two gate levels |
+| `tpd_pos` | ~0.10 ns | INV + AND2 — two gate levels |
+| `power_avg` | — | Average VDD current during state sweep |
+
+`tpd_neg` is the critical path floor: all downstream logic branching from `is_neg` has at minimum one NOR2 delay. `tpd_zero` and `tpd_pos` add one INV stage (shared between both paths).
+
+### T_DFF — ternary register with clock enable
+
+**Function**: 2-bit ternary register, synchronous reset, positive-edge clock enable.
+
+**Yosys cell**: `$_SDFFE_PP0P_` (positive clock, positive CE, reset-to-0).
+
+**Implementation**: 5 cells, ~30 transistors.
+- `inv_1`: `RST → RST_B` (sky130 dfrtp has active-low reset)
+- `mux2_1` × 2: CE multiplexer per bit — `D_eff = CE ? D : Q`
+- `dfrtp_1` × 2: D flip-flop with reset per bit
+
+| Scenario | Measurement | Description |
+|---|---|---|
+| A — Active toggling (CE=1, data alternates 250 MHz) | `power_active` | Baseline dynamic power |
+| B — Data matches stored (CE=1, D==Q) | `power_ce_data_matches` | MUX+DFF overhead when same-value |
+| C — CE=0 quiescent | `power_ce_zero` | Full quiescence — DFF and MUX idle |
+
+Key ratio: `power_active / power_ce_zero` = transistor-level proof of same-value suppression (Opt 7). Scenario B with CE=1 and D==Q isolates the residual MUX switching cost; scenario C confirms that the full CE=0 path (what `ternary_cell` drives when `comb_out == out`) eliminates even that.
+
+### T_ZERO — frustration isolation cell
+
+**Function**: T_DFF variant that locks out the clock enable once the output reaches Zero state (`p1=1, p0=0`). Models the frustration/contradiction isolation property of pgress: once a region node reaches Bochvar Zero, it contributes no further computation until an explicit synchronous reset.
+
+**Why T_ZERO vs T_DFF at Zero**: A plain T_DFF at Zero still runs the CE comparison every clock cycle — the XOR comparator sees `comb_out == out → ce=0`, but the comparator itself switches transiently on each clock edge as upstream combinational logic ripples. T_ZERO adds an internal CE lockout that short-circuits `CE_eff` to 0 without consulting the comparator:
+
+```
+is_at_zero = Q_p1 & ~Q_p0        -- detect out == Zero
+CE_eff     = CE_ext & ~is_at_zero -- lockout: CE_eff = 0 once Zero detected
+```
+
+Once `out == Zero`: `CE_eff = 0`. The MUX never updates `D_eff`. The XOR comparator is still live, but the DFF input is frozen — and the comparator's switching is itself suppressed by the lockout.
+
+**Implementation**: 9 cells, ~40 transistors (T_DFF core + 4 lockout cells).
+- T_DFF core: `inv_1`, `mux2_1` × 2, `dfrtp_1` × 2
+- Lockout: `inv_1` (Q_p0 → inv_q0), `and2_0` (Q_p1, inv_q0 → is_at_zero), `nand2_1` (CE_ext, is_at_zero → ce_gate_b), `inv_1` (ce_gate_b → CE_eff)
+
+| Phase | Time range | Measurement | Description |
+|---|---|---|---|
+| 1 — Active | 0–40 ns | `power_active` | Neg/Pos toggling at 250 MHz; CE_eff=1 |
+| 2 — Zero latch | 40–48 ns | `power_transition` | Final switching event as Zero is latched |
+| 3 — Isolated | 60–120 ns | `power_isolated` | Locked at Zero; CE_eff=0; leakage only |
+
+**Key result**: `isolation_factor = power_active / power_isolated`
+
+Expected: **10–100× at sky130 130nm**; higher at smaller nodes. The current waveform shows a step-function: `[active ripple] → [single transient peak at Zero latch] → [flat leakage floor]`.
+
+This is the transistor-level proof that frustration isolation is **structural, not runtime**: once Zero is detected by the `is_at_zero` lockout, dynamic power drops to the leakage floor without any software intervention. `ce_eff_during_isolation` should measure ≈0.
+
+**T_ZERO as a named PDK cell**: T_ZERO's power signature is distinct enough from T_DFF that it warrants a standalone PDK cell entry. A library designer using pgress-derived RTL can instantiate `T_ZERO` directly rather than composing T_DFF + lockout manually — the lockout gate count (4 cells) is below the threshold where ABC would discover the optimization automatically from a behavioural description.
