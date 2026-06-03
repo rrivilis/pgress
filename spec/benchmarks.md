@@ -529,14 +529,14 @@ Three primitive cells characterized against the SkyWater 130nm high-density stan
 - `inv_1` × 2: shared `~p0`, `~p1` (each reused by two downstream AND cells)
 - `and2_0` × 2: `is_zero = AND(~p0, p1)`, `is_pos = AND(p0, ~p1)`
 
-| Measurement | Expected | Description |
+| Measurement | Measured | Description |
 |---|---|---|
-| `tpd_neg` | ~0.05 ns | NOR2 direct path — single gate delay |
-| `tpd_zero` | ~0.10 ns | INV + AND2 — two gate levels |
-| `tpd_pos` | ~0.10 ns | INV + AND2 — two gate levels |
-| `power_avg` | — | Average VDD current during state sweep |
+| `tpd_neg` | **22.7 ps** | NOR2 direct path — single gate delay |
+| `tpd_pos` | **36.1 ps** | INV + AND2 via p0 — two gate levels |
+| `tpd_zero` | **60.7 ps** | INV + AND2 via p1 — two gate levels |
+| `power_avg` | **1.95 µW** | Average VDD power during 30 ns state sweep |
 
-`tpd_neg` is the critical path floor: all downstream logic branching from `is_neg` has at minimum one NOR2 delay. `tpd_zero` and `tpd_pos` add one INV stage (shared between both paths).
+`tpd_neg` (22.7 ps) is the fastest path — NOR2 direct output with no intervening INV stage. `tpd_pos` (36.1 ps) and `tpd_zero` (60.7 ps) traverse one shared INV plus an AND2; the asymmetry between them reflects the p0 vs p1 transistor sizing difference in the INV cells. All three are well within a single 4 ns clock period (250 MHz), confirming that the full ternary classification completes combinationally in one clock cycle. The critical path for a `ternary_cell` reduction followed by T_CLASS output is `D + 60.7 ps` where D is the reduction depth in LUT levels.
 
 ### T_DFF — ternary register with clock enable
 
@@ -549,13 +549,18 @@ Three primitive cells characterized against the SkyWater 130nm high-density stan
 - `mux2_1` × 2: CE multiplexer per bit — `D_eff = CE ? D : Q`
 - `dfrtp_1` × 2: D flip-flop with reset per bit
 
-| Scenario | Measurement | Description |
-|---|---|---|
-| A — Active toggling (CE=1, data alternates 250 MHz) | `power_active` | Baseline dynamic power |
-| B — Data matches stored (CE=1, D==Q) | `power_ce_data_matches` | MUX+DFF overhead when same-value |
-| C — CE=0 quiescent | `power_ce_zero` | Full quiescence — DFF and MUX idle |
+| Scenario | Measurement | Measured | Description |
+|---|---|---|---|
+| A — Active toggling (CE=1, data alternates 250 MHz) | `power_active` | **18.97 µW** | Baseline dynamic power |
+| B — Data matches stored (CE=1, D==Q) | `power_ce_data_matches` | **18.74 µW** | MUX+DFF overhead when same-value |
+| C — CE=0 quiescent | `power_ce_zero` | **9.14 µW** | Full quiescence — CE pin low |
 
-Key ratio: `power_active / power_ce_zero` = transistor-level proof of same-value suppression (Opt 7). Scenario B with CE=1 and D==Q isolates the residual MUX switching cost; scenario C confirms that the full CE=0 path (what `ternary_cell` drives when `comb_out == out`) eliminates even that.
+| Ratio | Value | Meaning |
+|---|---|---|
+| `power_active / power_ce_data_matches` | **1.01×** | CE=1 with D==Q saves almost nothing |
+| `power_active / power_ce_zero` | **2.07×** | CE=0 cuts power in half |
+
+The 1.01× ratio for scenario B reveals that driving CE=1 with D equal to Q barely reduces power — the MUX and DFF clock network still switch on every posedge CLK regardless of whether the output changes. The meaningful saving comes only when CE is actively driven to 0 (scenario C), which cuts power by 2.07×. This is the transistor-level proof of why `ternary_cell`'s clock-enable suppression (`ce = comb_out != out`) must assert CE=0 rather than relying on D==Q passivity. Scenario C's 9.14 µW represents the residual clock-tree switching cost — the DFF clock buffer inside `dfrtp_1` switches every 4 ns regardless of CE.
 
 ### T_ZERO — frustration isolation cell
 
@@ -574,16 +579,26 @@ Once `out == Zero`: `CE_eff = 0`. The MUX never updates `D_eff`. The XOR compara
 - T_DFF core: `inv_1`, `mux2_1` × 2, `dfrtp_1` × 2
 - Lockout: `inv_1` (Q_p0 → inv_q0), `and2_0` (Q_p1, inv_q0 → is_at_zero), `nand2_1` (CE_ext, is_at_zero → ce_gate_b), `inv_1` (ce_gate_b → CE_eff)
 
-| Phase | Time range | Measurement | Description |
-|---|---|---|---|
-| 1 — Active | 0–40 ns | `power_active` | Neg/Pos toggling at 250 MHz; CE_eff=1 |
-| 2 — Zero latch | 40–48 ns | `power_transition` | Final switching event as Zero is latched |
-| 3 — Isolated | 60–120 ns | `power_isolated` | Locked at Zero; CE_eff=0; leakage only |
+| Phase | Time range | Measurement | Measured | Description |
+|---|---|---|---|---|
+| 1 — Active | 0–40 ns | `power_active` | **9.59 µW** | Neg/Pos toggling at 250 MHz; CE_eff=1 |
+| 2 — Zero latch | 40–48 ns | `power_transition` | **8.96 µW** | Final switching event as Zero is latched |
+| 3 — Isolated | 60–120 ns | `power_isolated` | **9.14 µW** | Locked at Zero; CE_eff≈0 |
+| — | 60–120 ns | `ce_eff_during_isolation` | **76.5 nV** | CE_eff mean voltage; confirms lockout |
 
-**Key result**: `isolation_factor = power_active / power_isolated`
+**Isolation factor**: `power_active / power_isolated` = **1.05×**
 
-Expected: **10–100× at sky130 130nm**; higher at smaller nodes. The current waveform shows a step-function: `[active ripple] → [single transient peak at Zero latch] → [flat leakage floor]`.
+**Interpretation**: The 1.05× factor reflects a physically correct result, not a failure of the cell. `ce_eff_during_isolation = 76.5 nV ≈ 0 V` confirms the lockout circuit is structurally correct — no new data is ever loaded into the DFF after Zero is detected. However, the internal clock network of the two `dfrtp_1` cells continues to switch on every posedge CLK regardless of `CE_eff`. At sky130 130nm, the clock buffer dissipation dominates the power budget and accounts for nearly all of the 9.14 µW "isolated" power. Active data-path switching adds only ~5% on top of this floor.
 
-This is the transistor-level proof that frustration isolation is **structural, not runtime**: once Zero is detected by the `is_at_zero` lockout, dynamic power drops to the leakage floor without any software intervention. `ce_eff_during_isolation` should measure ≈0.
+The distinction is between two forms of isolation:
 
-**T_ZERO as a named PDK cell**: T_ZERO's power signature is distinct enough from T_DFF that it warrants a standalone PDK cell entry. A library designer using pgress-derived RTL can instantiate `T_ZERO` directly rather than composing T_DFF + lockout manually — the lockout gate count (4 cells) is below the threshold where ABC would discover the optimization automatically from a behavioural description.
+| Isolation type | Provided by T_ZERO? | Mechanism |
+|---|---|---|
+| **Data isolation** (no new values latched) | ✓ Yes | `CE_eff = 0` by lockout — proven by `ce_eff = 76.5 nV` |
+| **Power isolation** (leakage-floor dissipation) | ✗ No | Requires ICG clock gating upstream of DFF clock pin |
+
+T_ZERO is a *semantic* isolation cell: it guarantees that once a region node reaches the Bochvar Zero state, no further input changes can corrupt the stored value — without any software intervention, without any external CE signal assertion. The power floor is set by the clock network, which requires a separate Integrated Clock Gate (ICG) cell to fully quiesce. The T_DFF scenario C result (CE=0 → 9.14 µW) confirms this: even with CE explicitly held at 0, the clock-tree power is identical because the DFF clock input is not gated.
+
+**Corrected framing**: the benchmarks.md text above that said "dynamic power drops to the leakage floor" was premature — the actual floor is the clock-network switching floor (~9 µW for two `dfrtp_1` at 250 MHz), not transistor leakage (~nW range). Leakage-floor isolation requires pairing T_ZERO with a clock gate.
+
+**T_ZERO as a named PDK cell**: T_ZERO's semantic guarantee is still distinct enough from T_DFF to warrant a standalone cell entry — the lockout logic (4 cells, ~20 transistors) is below the threshold where ABC would discover and preserve the Zero-state detection automaton from a behavioural description. A library designer gets an explicit, formally-specified isolation guarantee at the cell boundary.

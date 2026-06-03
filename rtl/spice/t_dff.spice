@@ -40,16 +40,23 @@ Vvdd VDD 0 DC 'VDD'
 Vvss VSS 0 DC 0
 
 * ── DUT ──────────────────────────────────────────────────────────────────────
+* sky130_fd_sc_hd pin order:
+*   inv_1:   A VGND VNB VPB VPWR Y
+*   mux2_1:  A0 A1 S VGND VNB VPB VPWR X   (S=0→A0, S=1→A1)
+*   dfrtp_1: CLK D RESET_B VGND VNB VPB VPWR Q
+* VNB=VSS (N-well body), VPB=VDD (P-well body)
+
 * RST_B = active-low reset (dfrtp convention); RST is our active-high input.
-Xinv_rst RST RST_B VDD VSS sky130_fd_sc_hd__inv_1
+Xinv_rst RST VSS VSS VDD VDD RST_B  sky130_fd_sc_hd__inv_1
 
 * Bit p0 (p0 output bit, encoding bit 0)
-Xmux_p0  Q_p0 D_p0 CE D_eff_p0  VDD VSS sky130_fd_sc_hd__mux2_1
-Xdff_p0  CLK D_eff_p0 RST_B Q_p0  VDD VSS sky130_fd_sc_hd__dfrtp_1
+* mux: S=CE=0 → hold Q_p0 (A0); S=CE=1 → load D_p0 (A1)
+Xmux_p0  Q_p0 D_p0 CE  VSS VSS VDD VDD D_eff_p0  sky130_fd_sc_hd__mux2_1
+Xdff_p0  CLK D_eff_p0 RST_B  VSS VSS VDD VDD Q_p0  sky130_fd_sc_hd__dfrtp_1
 
 * Bit p1 (p1 output bit, encoding bit 1)
-Xmux_p1  Q_p1 D_p1 CE D_eff_p1  VDD VSS sky130_fd_sc_hd__mux2_1
-Xdff_p1  CLK D_eff_p1 RST_B Q_p1  VDD VSS sky130_fd_sc_hd__dfrtp_1
+Xmux_p1  Q_p1 D_p1 CE  VSS VSS VDD VDD D_eff_p1  sky130_fd_sc_hd__mux2_1
+Xdff_p1  CLK D_eff_p1 RST_B  VSS VSS VDD VDD Q_p1  sky130_fd_sc_hd__dfrtp_1
 
 * ── Parameters ───────────────────────────────────────────────────────────────
 .param TCLK=4ns     ; 250 MHz
@@ -85,7 +92,7 @@ VD_p1 D_p1 0 DC 0
 * ── Measurements ─────────────────────────────────────────────────────────────
 * Scenario A: active toggling power (CE=1, data changes every cycle)
 *   Measure from t=4ns (after reset) to t=60ns (15 clock cycles)
-.measure tran power_active AVG POWER FROM=4ns TO=60ns
+.measure tran power_active AVG par('(-v(VDD)*i(Vvdd))') FROM=4ns TO=60ns
 
 * Scenario B: CE=1 but data matches stored (D == Q, no actual toggle)
 *   Measure from t=60ns to t=80ns — at this point Q_p0 has settled to 0 and
@@ -96,11 +103,11 @@ VD_p1 D_p1 0 DC 0
 *   NOTE: this scenario measures the MUX+DFF overhead when D==Q and CE=1.
 *   In the full ternary_cell design, CE is driven to 0 before this point,
 *   so the actual cell is even quieter (scenario C below).
-.measure tran power_ce_data_matches AVG POWER FROM=60ns TO=80ns
+.measure tran power_ce_data_matches AVG par('(-v(VDD)*i(Vvdd))') FROM=60ns TO=80ns
 
 * Scenario C: CE=0 explicitly — full quiescence
 *   (CE pin driven low at t=80ns, see VCE above)
-.measure tran power_ce_zero AVG POWER FROM=84ns TO=120ns
+.measure tran power_ce_zero AVG par('(-v(VDD)*i(Vvdd))') FROM=84ns TO=120ns
 
 * ── Output ───────────────────────────────────────────────────────────────────
 .print tran v(CLK) v(CE) v(D_p0) v(Q_p0) v(Q_p1)

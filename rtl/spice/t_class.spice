@@ -47,18 +47,24 @@ Vvdd VDD 0 DC 'VDD'
 Vvss VSS 0 DC 0
 
 * ── DUT ──────────────────────────────────────────────────────────────────────
+* sky130_fd_sc_hd pin order:
+*   inv_1:  A VGND VNB VPB VPWR Y
+*   nor2_1: A B VGND VNB VPB VPWR Y
+*   and2_0: A B VGND VNB VPB VPWR X
+* VNB=VSS (N-well body), VPB=VDD (P-well body)
+
 * Shared inversions (reused by two downstream AND cells each)
-Xinv_p0  p0 inv_p0  VDD VSS sky130_fd_sc_hd__inv_1
-Xinv_p1  p1 inv_p1  VDD VSS sky130_fd_sc_hd__inv_1
+Xinv_p0  p0    VSS VSS VDD VDD inv_p0  sky130_fd_sc_hd__inv_1
+Xinv_p1  p1    VSS VSS VDD VDD inv_p1  sky130_fd_sc_hd__inv_1
 
 * is_neg = NOR(p0, p1) = ~p0 & ~p1
-Xnor2    p0 p1 is_neg  VDD VSS sky130_fd_sc_hd__nor2_1
+Xnor2    p0 p1 VSS VSS VDD VDD is_neg  sky130_fd_sc_hd__nor2_1
 
 * is_zero = AND(~p0, p1)
-Xand_zero  inv_p0 p1 is_zero  VDD VSS sky130_fd_sc_hd__and2_0
+Xand_zero  inv_p0 p1    VSS VSS VDD VDD is_zero  sky130_fd_sc_hd__and2_0
 
 * is_pos = AND(p0, ~p1)
-Xand_pos   p0 inv_p1 is_pos   VDD VSS sky130_fd_sc_hd__and2_0
+Xand_pos   p0    inv_p1 VSS VSS VDD VDD is_pos   sky130_fd_sc_hd__and2_0
 
 * ── Stimulus ─────────────────────────────────────────────────────────────────
 * Step through all valid ternary inputs:
@@ -106,12 +112,15 @@ Vp1 p1 0 PWL(
 .measure tran tpd_zero TRIG v(p1) VAL='VDD/2' RISE=1 TD=9ns
 +                      TARG v(is_zero) VAL='VDD/2' RISE=1
 
-* Propagation delay: p0 1→0 at t=10ns → is_neg should rise (NOR direct path)
-.measure tran tpd_neg TRIG v(p0) VAL='VDD/2' FALL=1 TD=9ns
+* Propagation delay: NOR2 path — p1 1→0 at t=15ns while p0=0 → is_neg rises.
+* (At t=10ns p0 falls AND p1 rises simultaneously, so is_neg can't rise then;
+*  the clean NOR2 measurement uses the t=15ns transition: p1 falls, p0 already 0.)
+.measure tran tpd_neg TRIG v(p1) VAL='VDD/2' FALL=1 TD=14ns
 +                     TARG v(is_neg) VAL='VDD/2' RISE=1
 
 * Average power (full transient)
-.measure tran power_avg AVG POWER FROM=0ns TO=30ns
+* ngspice: 'power' is not a vector; use par() expression for VDD*I(source)
+.measure tran power_avg AVG par('(-v(VDD)*i(Vvdd))') FROM=0ns TO=30ns
 
 * ── Output ───────────────────────────────────────────────────────────────────
 .print tran v(p0) v(p1) v(is_neg) v(is_zero) v(is_pos)

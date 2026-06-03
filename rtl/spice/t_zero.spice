@@ -68,23 +68,32 @@ Vvdd VDD 0 DC 'VDD'
 Vvss VSS 0 DC 0
 
 * ── DUT: T_DFF core ──────────────────────────────────────────────────────────
-Xinv_rst RST RST_B  VDD VSS sky130_fd_sc_hd__inv_1
+* sky130_fd_sc_hd pin order:
+*   inv_1:   A VGND VNB VPB VPWR Y
+*   mux2_1:  A0 A1 S VGND VNB VPB VPWR X   (S=0→A0, S=1→A1)
+*   dfrtp_1: CLK D RESET_B VGND VNB VPB VPWR Q
+*   and2_0:  A B VGND VNB VPB VPWR X
+*   nand2_1: A B VGND VNB VPB VPWR Y
+* VNB=VSS (N-well body), VPB=VDD (P-well body)
 
-Xmux_p0  Q_p0 D_p0 CE_eff D_eff_p0  VDD VSS sky130_fd_sc_hd__mux2_1
-Xdff_p0  CLK D_eff_p0 RST_B Q_p0    VDD VSS sky130_fd_sc_hd__dfrtp_1
+Xinv_rst RST VSS VSS VDD VDD RST_B  sky130_fd_sc_hd__inv_1
 
-Xmux_p1  Q_p1 D_p1 CE_eff D_eff_p1  VDD VSS sky130_fd_sc_hd__mux2_1
-Xdff_p1  CLK D_eff_p1 RST_B Q_p1    VDD VSS sky130_fd_sc_hd__dfrtp_1
+* mux: S=CE_eff=0 → hold Q (A0); S=CE_eff=1 → load D (A1)
+Xmux_p0  Q_p0 D_p0 CE_eff  VSS VSS VDD VDD D_eff_p0  sky130_fd_sc_hd__mux2_1
+Xdff_p0  CLK D_eff_p0 RST_B  VSS VSS VDD VDD Q_p0    sky130_fd_sc_hd__dfrtp_1
+
+Xmux_p1  Q_p1 D_p1 CE_eff  VSS VSS VDD VDD D_eff_p1  sky130_fd_sc_hd__mux2_1
+Xdff_p1  CLK D_eff_p1 RST_B  VSS VSS VDD VDD Q_p1    sky130_fd_sc_hd__dfrtp_1
 
 * ── DUT: CE lockout (frustration isolation) ──────────────────────────────────
 * Detect Zero state: is_at_zero = Q_p1 & ~Q_p0
-Xinv_q0  Q_p0 inv_q0  VDD VSS sky130_fd_sc_hd__inv_1
-Xdetect  Q_p1 inv_q0 is_at_zero  VDD VSS sky130_fd_sc_hd__and2_0
+Xinv_q0  Q_p0 VSS VSS VDD VDD inv_q0  sky130_fd_sc_hd__inv_1
+Xdetect  Q_p1 inv_q0 VSS VSS VDD VDD is_at_zero  sky130_fd_sc_hd__and2_0
 
 * CE_eff = CE_ext & ~is_at_zero
 * Implement as: NAND2(CE_ext, is_at_zero) → INV → CE_eff
-Xlockout  CE_ext is_at_zero ce_gate_b  VDD VSS sky130_fd_sc_hd__nand2_1
-Xinv_ce   ce_gate_b CE_eff             VDD VSS sky130_fd_sc_hd__inv_1
+Xlockout  CE_ext is_at_zero VSS VSS VDD VDD ce_gate_b  sky130_fd_sc_hd__nand2_1
+Xinv_ce   ce_gate_b VSS VSS VDD VDD CE_eff              sky130_fd_sc_hd__inv_1
 
 * ── Parameters ───────────────────────────────────────────────────────────────
 .param TCLK=4ns
@@ -143,16 +152,16 @@ VD_p1 D_p1 0 PWL(
 
 * ── Measurements ─────────────────────────────────────────────────────────────
 * Phase 1: active power (Neg/Pos toggling, 250 MHz)
-.measure tran power_active AVG POWER FROM=2ns TO=40ns
+.measure tran power_active AVG par('(-v(VDD)*i(Vvdd))') FROM=2ns TO=40ns
 
 * Phase 2: transition energy (single Zero-latch clock edge)
 * Zero arrives at t=40ns; the next posedge is at t=42ns (assuming clk starts at 0).
 * Measure over 2 clock cycles around the transition.
-.measure tran power_transition AVG POWER FROM=40ns TO=48ns
+.measure tran power_transition AVG par('(-v(VDD)*i(Vvdd))') FROM=40ns TO=48ns
 
 * Phase 3: isolated / frustrated (locked at Zero, leakage only)
 * By t=48ns, is_at_zero=1 and CE_eff=0. Measure steady-state leakage.
-.measure tran power_isolated AVG POWER FROM=60ns TO=120ns
+.measure tran power_isolated AVG par('(-v(VDD)*i(Vvdd))') FROM=60ns TO=120ns
 
 * Verify lockout: CE_eff must be 0 during phase 3
 .measure tran ce_eff_during_isolation AVG v(CE_eff) FROM=60ns TO=120ns
