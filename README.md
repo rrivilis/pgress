@@ -325,6 +325,10 @@ pgress/
 │       ├── run_verilator.sh
 │       ├── run_topology.sh
 │       └── build/               — generated Verilator output (not checked in)
+├── asm/                 — x86-64 SSE2 bitplane kernels (machine-level semantics witness)
+│   ├── ternary_propkernel.S — meetall_sse2, joinany_sse2, region_quiescent
+│   ├── test_propkernel.c    — 26 witness tests; chain propagation quiescence proof
+│   └── Makefile             — gcc only (GAS .S; no nasm required)
 ├── demo/                — React + FastAPI interactive demo
 │   ├── backend/         — Python FastAPI server; 6 scenarios
 │   └── frontend/        — React Flow canvas; ternary state visualization
