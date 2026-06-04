@@ -55,12 +55,16 @@ verilator \
     -Wno-WIDTHTRUNC \
     -Wno-UNUSEDSIGNAL \
     -Wno-WIDTHEXPAND \
+    -Wno-LATCH \
+    -Wno-COMBDLY \
     --top-module tb_topology \
     --Mdir "$OUT_DIR" \
     $TRACE_FLAGS \
     "$SV_DIR/ternary_cell.sv" \
     "$SV_DIR/ternary_chain.sv" \
     "$SV_DIR/ternary_tree.sv" \
+    "$SV_DIR/icg_model.sv" \
+    "$SV_DIR/ternary_region.sv" \
     "$SV_DIR/tb_topology.sv"
 
 echo ""

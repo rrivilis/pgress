@@ -41,11 +41,15 @@
 //!
 //! ## v1 scope
 //!
-//! - Only `ADVISORY` bootstrap is wired end-to-end. `ASSERTED`/`ATTESTED` return
-//!   `ProfileVerification(Unimplemented)` until signing infrastructure is wired
-//!   (see `profile.rs`).
-//! - `DepKind::Remote` (cross-partition edges) returns `RemoteDepNotSupported`
-//!   in v1. Full `RemoteDep` wire encoding will be defined in a future ABI revision.
+//! - `ADVISORY` and `ASSERTED`/`ATTESTED` bootstrap are both wired end-to-end.
+//!   `ASSERTED`/`ATTESTED` require a `VerifyingKey` pre-registered in
+//!   `runtime.trust_store` for the `issuer_domain`; `ProfileError::UnknownIssuer`
+//!   is returned if the key is absent.
+//! - `DepKind::Remote` (cross-partition edges) is fully supported. Wire layout:
+//!   after the common `dep_kind`/`port_kind`/`port_name` preamble (framing fields),
+//!   Remote payloads carry `source_partition`, `source_uid`, `source_version`,
+//!   `payload_kind`, optional `zero_kind`, `causal_frontier`, and authority fields.
+//!   See `parse_payload` opcode 0x0002 for the complete field-by-field layout.
 //! - After `PartitionCreate` succeeds on the engine, the Dispatcher registers the
 //!   new partition in `runtime.domains.partitions` with `ShardId(0)` (the bootstrap
 //!   shard). Multi-shard placement is a future enhancement.
@@ -62,16 +66,20 @@ use pgress_core::{
         Port, PortKind, QueuePriority, RewriteBudget, RewriteStrategy,
         RetryPolicy, StabilizationConfig, StabilizationDomain,
     },
-    partition::{CapabilityBits, CausalScope, DepKind, EdgeLabel, LatticeClass, PartitionId},
+    partition::{
+        CapabilityBits, CausalScope, DepKind, EdgeLabel, LatticeClass, PartitionId,
+        PayloadKind, RemoteDep, ZeroKind,
+    },
     propagate::PropEvent,
     region::{CompilePolicy, RegionBoundary, StabilityContract},
     ternary::T,
+    time::VectorClock,
     uid::Uid,
 };
 
 use crate::{
     admission::ShardPressure,
-    auth::{AuthTableKey, PartitionAuthRow},
+    auth::{AuthTableKey, AuthorityPolicy, PartitionAuthRow},
     decode::{IngressError, RecordAction, StreamDecoder, StreamPreamble},
     domain::{PartitionDomain, SessionDomain, SessionQuota},
     runtime::{ParsedHeader, RejectionReason, RouteOutcome, SessionRuntime},
@@ -327,8 +335,71 @@ pub fn parse_payload(opcode: u16, payload: &[u8]) -> Result<IsaOp, DispatchError
                     DepKind::Local(port)
                 },
                 0x01 => {
-                    // Remote: full RemoteDep wire encoding is not defined in v1.
-                    return Err(DispatchError::RemoteDepNotSupported);
+                    // Remote: cross-partition dep with full causal provenance.
+                    //
+                    // Wire layout (all fields after the common preamble):
+                    //   source_partition: u64   (low-64 of UUID)
+                    //   source_uid:       u64
+                    //   source_version:   u64
+                    //   payload_kind:     u8    (0=Definite, 1=TypedZero)
+                    //   [zero_kind:       u8]   (only if payload_kind=1)
+                    //   frontier_count:   u16
+                    //   frontier[]:       { partition_id:u64, clock:u64 } * frontier_count
+                    //   source_authority: u64
+                    //   emitted_class:    u64
+                    //   capability_bits:  u8
+                    //   causal_scope_bits:u64
+                    //
+                    // port_kind and empty port_name were already consumed above
+                    // (common preamble for framing consistency).
+                    let source_partition  = wire_to_partition_id(r.read_u64()?);
+                    let source_uid        = wire_to_uid(r.read_u64()?);
+                    let source_version    = r.read_u64()?;
+                    let payload_kind_byte = r.read_u8()?;
+                    let payload_kind = match payload_kind_byte {
+                        0x00 => PayloadKind::Definite,
+                        0x01 => {
+                            let zk_byte = r.read_u8()?;
+                            let zk = match zk_byte {
+                                0x00 => ZeroKind::Conflict,
+                                0x01 => ZeroKind::Incomplete,
+                                0x02 => ZeroKind::Ambiguous,
+                                0x03 => ZeroKind::Retracted,
+                                0x04 => ZeroKind::BoundaryViolation,
+                                0x05 => ZeroKind::VersionSkew,
+                                b    => return Err(DispatchError::UnknownZeroKind(b)),
+                            };
+                            PayloadKind::TypedZero(zk)
+                        },
+                        b => return Err(DispatchError::UnknownPayloadKind(b)),
+                    };
+                    let frontier_count = r.read_u16()? as usize;
+                    let mut causal_frontier = VectorClock::new();
+                    for _ in 0..frontier_count {
+                        let pid   = wire_to_partition_id(r.read_u64()?);
+                        let clock = r.read_u64()?;
+                        causal_frontier.set(pid, clock);
+                    }
+                    let source_authority  = wire_to_partition_id(r.read_u64()?);
+                    let emitted_class     = LatticeClass(r.read_u64()?);
+                    let capability        = CapabilityBits(r.read_u8()? as u64);
+                    let causal_scope_bits = r.read_u64()?;
+
+                    DepKind::Remote(RemoteDep {
+                        source_partition,
+                        source_uid,
+                        source_version,
+                        port_kind: pk,
+                        causal_frontier,
+                        payload_kind,
+                        source_authority,
+                        emitted_class,
+                        capability,
+                        causal_scope: CausalScope {
+                            scope_bits: causal_scope_bits,
+                            root: PartitionId::nil(),
+                        },
+                    })
                 },
                 b => return Err(DispatchError::UnknownDepKind(b)),
             };
@@ -610,8 +681,11 @@ pub enum DispatchError {
     #[error("unsupported attr value tag byte 0x{0:02x} (no Val variant)")]
     UnsupportedAttrTag(u8),
 
-    #[error("remote dep (dep_kind=1) is not supported in v1; full wire encoding is a future ABI revision")]
-    RemoteDepNotSupported,
+    #[error("unknown zero_kind discriminant byte 0x{0:02x} in RemoteDep payload")]
+    UnknownZeroKind(u8),
+
+    #[error("unknown payload_kind discriminant byte 0x{0:02x} in RemoteDep payload")]
+    UnknownPayloadKind(u8),
 
     #[error("unknown region boundary tag byte 0x{0:02x}")]
     UnknownRegionBoundaryTag(u8),
@@ -621,6 +695,14 @@ pub enum DispatchError {
 
     #[error("unknown compile policy byte 0x{0:02x}")]
     UnknownCompilePolicy(u8),
+
+    /// Session lacks the disclosure bits required to install a cross-partition edge.
+    ///
+    /// Enforces: `session.disclosure ∩ edge.causal_scope_bits == edge.causal_scope_bits`.
+    /// Raised before engine apply for `EdgeConnect(Remote)` and `SetEdgeLabel` with
+    /// non-zero causal scope.
+    #[error("disclosure authority insufficient: required {required:#018x}, held {held:#018x}")]
+    DisclosureViolation { required: u64, held: u64 },
 }
 
 // ── DispatchOutcome ───────────────────────────────────────────────────────────
@@ -650,9 +732,19 @@ pub enum DispatchOutcome {
 /// access with default settings (`Advisory` authority mode, default max steps).
 /// Calling code may configure specific shard engines via `get_or_insert` before
 /// the first record arrives on that shard.
+///
+/// Also tracks per-partition `stabilize_count` — the number of times a
+/// `Stabilize` op has completed on each `WirePartitionId`. This is the
+/// session-manager-layer analog of `gated_trunk_cycles` in `ternary_region.sv`:
+/// consecutive stabilize completions on the same partition indicate that the
+/// region's e-graph quotient is stable. Passed to `notify_region_quiescent` as
+/// `quiescent_epochs` so the telemetry hierarchy has a running epoch count.
 #[derive(Default)]
 pub struct EnginePool {
-    engines: FxHashMap<ShardId, Engine>,
+    engines:        FxHashMap<ShardId, Engine>,
+    /// Cumulative stabilize-completion count per partition (not per region-root).
+    /// Reset to zero when a non-Stabilize op lands on the partition (region woke up).
+    stabilize_count: FxHashMap<WirePartitionId, u32>,
 }
 
 impl EnginePool {
@@ -674,6 +766,27 @@ impl EnginePool {
         self.get_or_insert(shard_id)
             .apply(op)
             .map_err(DispatchError::Engine)
+    }
+
+    /// Record that a `Stabilize` op completed on `partition_id`.
+    ///
+    /// Increments the epoch counter (saturating at `u32::MAX`).
+    /// Returns the new count, which is passed to `notify_region_quiescent`.
+    pub fn record_stabilize_complete(&mut self, partition_id: WirePartitionId) -> u32 {
+        let count = self.stabilize_count.entry(partition_id).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Record a non-Stabilize op on `partition_id` — resets the quiescent epoch
+    /// counter, indicating the region has woken from its fixed point.
+    pub fn record_region_wake(&mut self, partition_id: WirePartitionId) {
+        self.stabilize_count.remove(&partition_id);
+    }
+
+    /// Current stabilize epoch count for `partition_id` (0 if no Stabilize ops yet).
+    pub fn stabilize_epochs(&self, partition_id: WirePartitionId) -> u32 {
+        self.stabilize_count.get(&partition_id).copied().unwrap_or(0)
     }
 
     /// Snapshot current `ShardPressure` for `shard_id`.
@@ -768,6 +881,47 @@ impl Dispatcher {
         }
     }
 
+    // ── Shard placement ──────────────────────────────────────────────────────
+
+    /// Pick the best shard for a new partition belonging to `session_id`.
+    ///
+    /// Strategy (in priority order):
+    ///
+    /// 1. **Locality hint**: find any existing partition for this session, look
+    ///    up its shard's `fabric_addr`, and ask `TopologyPartition::best_shard_for`
+    ///    for the healthy shard with the smallest hop distance.
+    ///
+    /// 2. **Any healthy shard**: if there's no locality hint (first partition
+    ///    for this session), ask for any healthy shard (lowest ShardId wins).
+    ///
+    /// 3. **Bootstrap fallback**: if the topology map is empty or no shard is
+    ///    healthy, fall back to `ShardId(0)`. This preserves existing behaviour
+    ///    for single-node deployments.
+    fn pick_shard_for(&self, session_id: SessionId) -> ShardId {
+        // 1. Find a locality hint from the session's existing partition assignments.
+        let hint = self.runtime.domains.partitions.values()
+            .find(|p| p.session_id == session_id)
+            .and_then(|p| self.runtime.domains.shards.get(&p.shard_id))
+            .and_then(|s| s.fabric_addr.as_ref().copied());
+
+        if let Some(addr) = hint {
+            if let Some(best) = self.runtime.topology.best_shard_for(
+                &addr,
+                &self.runtime.domains,
+            ) {
+                return best;
+            }
+        }
+
+        // 2. No locality hint: any healthy shard.
+        if let Some(any) = self.runtime.topology.any_healthy_shard() {
+            return any;
+        }
+
+        // 3. Fallback: bootstrap shard (topology map empty or all shards unhealthy).
+        ShardId(0)
+    }
+
     // ── Profile / bootstrap ───────────────────────────────────────────────────
 
     fn handle_profile(
@@ -793,12 +947,14 @@ impl Dispatcher {
             let auth_mode = pgress_core::partition::AuthorityMode::Advisory;
 
             self.runtime.sessions.create(SessionEntry {
-                session_id:       header.session_id,
+                session_id:                   header.session_id,
                 tenant_id,
-                active_path_id:   Some(new_path_id),
-                prev_path_id:     None,
-                stream_seq_floor: header.stream_seq,
+                active_path_id:               Some(new_path_id),
+                prev_path_id:                 None,
+                stream_seq_floor:             header.stream_seq,
                 auth_mode,
+                last_active_causal_epoch:     0,
+                consecutive_quiescent_epochs: 0,
             });
             self.runtime.paths.create(PathEntry {
                 path_id:             new_path_id,
@@ -808,12 +964,14 @@ impl Dispatcher {
             });
 
             // Mirror into DomainRegistry so process_profile can locate it.
+            // Start with NONE (no authority) — process_profile will install the
+            // effective policy after verification.
             self.runtime.domains.register_session(SessionDomain {
-                id:           header.session_id,
+                id:             header.session_id,
                 tenant_id,
-                claimed_caps: CapabilityBits::NONE,
+                claimed_policy: AuthorityPolicy::NONE,
                 auth_mode,
-                quota:        SessionQuota::default(),
+                quota:          SessionQuota::default(),
             });
         } else {
             // ── Re-bootstrap: session exists, new path arriving ───────────────
@@ -866,6 +1024,37 @@ impl Dispatcher {
         // Deserialise the record body.
         let op = parse_payload(header.opcode, payload)?;
 
+        // ── Disclosure check (cross-partition authority) ───────────────────────
+        // SetEdgeLabel and EdgeConnect(Remote) may reveal distinctions across
+        // partition boundaries. The session must hold every bit required by the
+        // edge's causal scope before the operation reaches the engine.
+        //
+        // Enforcement: session.disclosure ∩ edge.causal_scope_bits == edge.causal_scope_bits
+        //
+        // Permissive fallback (u64::MAX) for sessions absent from DomainRegistry
+        // preserves local bootstrap semantics: a session created via SessionTable
+        // without a matching SessionDomain entry is treated as fully trusted.
+        let required_disclosure: Option<u64> = match &op {
+            IsaOp::EdgeConnect { dep: DepKind::Remote(remote), .. } => {
+                let req = remote.causal_scope.scope_bits;
+                if req != 0 { Some(req) } else { None }
+            },
+            IsaOp::SetEdgeLabel { label, .. } => {
+                let req = label.causal_scope.scope_bits;
+                if req != 0 { Some(req) } else { None }
+            },
+            _ => None,
+        };
+        if let Some(required) = required_disclosure {
+            let held = self.runtime.domains
+                .effective_policy(header.session_id)
+                .map(|p| p.disclosure)
+                .unwrap_or(u64::MAX);
+            if (held & required) != required {
+                return Err(DispatchError::DisclosureViolation { required, held });
+            }
+        }
+
         // Apply to the engine shard.
         let events = self.shards.apply(shard_id, op.clone())?;
 
@@ -880,14 +1069,47 @@ impl Dispatcher {
             self.feedback_control_op(header, &op);
         }
 
+        // ── Stabilize: emit RegionQuiescent when the e-graph fixed point is reached.
+        //
+        // The engine's `Stabilize` arm runs synchronously — when `apply` returns,
+        // the region is at its fixed point (the e-graph quotient has stabilized).
+        // This is the moment the region-level ICG fires: NOR(ce_out[0..K-1]) = 1.
+        //
+        // For named regions: use `seeds[0]` as the canonical region root (the seed
+        // that initiated the build_section_region expansion).
+        // For global Stabilize (region=None): use a stable synthetic root derived
+        // from the wire partition ID so the telemetry node is addressable.
+        //
+        // Non-Stabilize ops reset the stabilize epoch counter — the region woke up.
+        if let IsaOp::Stabilize { ref region } = op {
+            let region_root = region
+                .as_ref()
+                .and_then(|seeds| seeds.first().copied())
+                .unwrap_or_else(|| wire_to_uid(header.partition_id.0));
+            let epoch_count = self.shards.record_stabilize_complete(header.partition_id);
+            // `quiescent = true`: region entered its fixed point this apply cycle.
+            self.runtime.notify_region_quiescent(
+                region_root,
+                header.partition_id,
+                true,
+                epoch_count,
+            );
+        } else if matches!(opcode_class, OpcodeClass::SetValue | OpcodeClass::Propagate) {
+            // A value-changing op wakes the region. Reset the epoch counter so
+            // the next Stabilize sequence starts from 0 (analogous to resetting
+            // gated_trunk_cycles on clock enable assertion).
+            self.shards.record_region_wake(header.partition_id);
+        }
+
         Ok(DispatchOutcome::Applied { shard_id, events })
     }
 
     /// Propagate control-op outcomes back into the session runtime.
     ///
     /// `PartitionCreate`: register new partition in `DomainRegistry.partitions`
-    /// (using `ShardId(0)` in v1) and install permissive auth rows in
-    /// `PartitionAuthTable` so subsequent data ops can pass the gate.
+    /// using topology-aware shard placement (see `pick_shard_for`), and install
+    /// permissive auth rows in `PartitionAuthTable` so subsequent data ops can
+    /// pass the gate.
     ///
     /// `SetPartitionAuthority`: update the `lattice_class` / `causal_scope` in
     /// the existing partition domain entry.
@@ -897,13 +1119,19 @@ impl Dispatcher {
                 // Recover the wire partition ID from the UUID's low 64 bits.
                 let wire_id = WirePartitionId(id.as_u128() as u64);
 
+                // Multi-shard placement: pick the best healthy shard for this
+                // partition, using the session's existing partitions as a
+                // locality hint. Falls back to ShardId(0) if the topology map
+                // is empty or no healthy shard is available.
+                let shard_id = self.pick_shard_for(header.session_id);
+
                 // Register partition → shard mapping.
                 self.runtime.domains.register_partition(PartitionDomain {
                     id:            wire_id,
                     session_id:    header.session_id,
                     lattice_class: *lattice_class,
                     causal_scope:  causal_domain.scope_bits,
-                    shard_id:      ShardId(0),
+                    shard_id,
                 });
 
                 // Install permissive auth rows for every opcode class so that
@@ -1098,18 +1326,69 @@ mod tests {
     }
 
     #[test]
-    fn edge_connect_remote_dep_rejected() {
+    fn edge_connect_remote_dep_roundtrip() {
+        // Full RemoteDep round-trip: encode the minimum valid wire payload and
+        // verify parse_payload produces DepKind::Remote with the expected fields.
+        let mut p = Vec::new();
+        // Common preamble
+        p.extend_from_slice(&le_u64(1));  // edge_id
+        p.extend_from_slice(&le_u64(2));  // src
+        p.extend_from_slice(&le_u64(3));  // tgt
+        p.push(0x01);                     // dep_kind = Remote
+        p.push(0x02);                     // port_kind = Flow
+        p.extend_from_slice(&le_u16(0));  // empty port_name (Remote framing)
+        // RemoteDep fields
+        p.extend_from_slice(&le_u64(42));          // source_partition
+        p.extend_from_slice(&le_u64(7));           // source_uid
+        p.extend_from_slice(&le_u64(3));           // source_version
+        p.push(0x00);                              // payload_kind = Definite
+        p.extend_from_slice(&le_u16(0));           // frontier_count = 0 (empty clock)
+        p.extend_from_slice(&le_u64(42));          // source_authority
+        p.extend_from_slice(&le_u64(0));           // emitted_class = BOTTOM
+        p.push(0x07);                              // capability = READ|PROPAGATE|STABILIZE
+        p.extend_from_slice(&le_u64(u64::MAX));    // causal_scope_bits = UNIVERSAL
+
+        let op = parse_payload(0x0002, &p).unwrap();
+        if let IsaOp::EdgeConnect { dep: DepKind::Remote(r), .. } = op {
+            assert_eq!(r.source_version, 3);
+            assert_eq!(r.port_kind, PortKind::Flow);
+            assert!(!r.is_zero());
+            assert_eq!(r.capability, pgress_core::partition::CapabilityBits(0x07));
+        } else {
+            panic!("expected EdgeConnect with Remote dep, got: {:?}", op);
+        }
+    }
+
+    #[test]
+    fn edge_connect_remote_dep_typed_zero() {
         let mut p = Vec::new();
         p.extend_from_slice(&le_u64(1));
         p.extend_from_slice(&le_u64(2));
         p.extend_from_slice(&le_u64(3));
-        p.push(0x01); // Remote
-        p.push(0x00);
-        p.extend_from_slice(&le_u16(0));
-        assert!(matches!(
-            parse_payload(0x0002, &p),
-            Err(DispatchError::RemoteDepNotSupported)
-        ));
+        p.push(0x01);                     // dep_kind = Remote
+        p.push(0x00);                     // port_kind = Signal
+        p.extend_from_slice(&le_u16(0));  // empty port_name
+        // RemoteDep fields
+        p.extend_from_slice(&le_u64(10));          // source_partition
+        p.extend_from_slice(&le_u64(5));           // source_uid
+        p.extend_from_slice(&le_u64(1));           // source_version
+        p.push(0x01);                              // payload_kind = TypedZero
+        p.push(0x00);                              // zero_kind = Conflict
+        p.extend_from_slice(&le_u16(1));           // frontier_count = 1
+        p.extend_from_slice(&le_u64(10));          // frontier[0] partition_id
+        p.extend_from_slice(&le_u64(99));          // frontier[0] clock
+        p.extend_from_slice(&le_u64(10));          // source_authority
+        p.extend_from_slice(&le_u64(0));           // emitted_class
+        p.push(0x01);                              // capability = READ
+        p.extend_from_slice(&le_u64(u64::MAX));    // causal_scope_bits
+
+        let op = parse_payload(0x0002, &p).unwrap();
+        if let IsaOp::EdgeConnect { dep: DepKind::Remote(r), .. } = op {
+            assert!(r.is_zero());
+            assert_eq!(r.zero_kind(), Some(pgress_core::partition::ZeroKind::Conflict));
+        } else {
+            panic!("expected Remote dep");
+        }
     }
 
     #[test]
@@ -1348,9 +1627,9 @@ mod tests {
     }
 
     fn setup_dispatcher_with_session() -> (Dispatcher, u64, u64, u64) {
-        use pgress_core::partition::{AuthorityMode, CapabilityBits};
+        use pgress_core::partition::AuthorityMode;
         use crate::{
-            auth::{AuthTableKey, PartitionAuthRow},
+            auth::{AuthorityPolicy, AuthTableKey, PartitionAuthRow},
             domain::{PartitionDomain, TenantDomain, TenantQuota},
             session::{PathEntry, PathState, SessionEntry},
         };
@@ -1363,24 +1642,26 @@ mod tests {
 
         // Local bootstrap: register tenant, session, path, partition.
         d.runtime.domains.register_tenant(TenantDomain {
-            id:           TenantId(0),
-            capabilities: CapabilityBits::ALL,
-            quota:        TenantQuota::default(),
+            id:     TenantId(0),
+            policy: AuthorityPolicy::ALL,
+            quota:  TenantQuota::default(),
         });
         d.runtime.domains.register_session(SessionDomain {
-            id:           SessionId(session_id),
-            tenant_id:    TenantId(0),
-            claimed_caps: CapabilityBits::ALL,
-            auth_mode:    AuthorityMode::Advisory,
-            quota:        SessionQuota::default(),
+            id:             SessionId(session_id),
+            tenant_id:      TenantId(0),
+            claimed_policy: AuthorityPolicy::ALL,
+            auth_mode:      AuthorityMode::Advisory,
+            quota:          SessionQuota::default(),
         });
         d.runtime.sessions.create(SessionEntry {
-            session_id:       SessionId(session_id),
-            tenant_id:        TenantId(0),
-            active_path_id:   Some(PathId(path_id)),
-            prev_path_id:     None,
-            stream_seq_floor: 0,
-            auth_mode:        AuthorityMode::Advisory,
+            session_id:                   SessionId(session_id),
+            tenant_id:                    TenantId(0),
+            active_path_id:               Some(PathId(path_id)),
+            prev_path_id:                 None,
+            stream_seq_floor:             0,
+            auth_mode:                    AuthorityMode::Advisory,
+            last_active_causal_epoch:     0,
+            consecutive_quiescent_epochs: 0,
         });
         d.runtime.paths.create(PathEntry {
             path_id:             PathId(path_id),
@@ -1472,6 +1753,131 @@ mod tests {
             outcome,
             DispatchOutcome::Rejected(RejectionReason::UnknownPartition)
         ));
+    }
+
+    // ── Stabilize → RegionQuiescent telemetry wiring ─────────────────────────
+
+    #[test]
+    fn stabilize_op_emits_region_quiescent_telemetry() {
+        // When a Stabilize op is processed, the dispatcher must emit a
+        // RegionQuiescent telemetry event with quiescent=true.
+        //
+        // This validates the "Stabilize → region-level ICG signal → RegionQuiescent"
+        // wiring: after engine.apply(Stabilize) returns synchronously, the region
+        // is at its e-graph fixed point and the session manager records the event.
+        let (mut d, session_id, path_id, partition_id) = setup_dispatcher_with_session();
+
+        let preamble = make_preamble(path_id, session_id);
+        d.process_preamble(&preamble).unwrap();
+
+        // Drain bootstrap telemetry so the assertion sees only our events.
+        d.runtime.telemetry.drain();
+
+        // Stabilize with no region (global: all Zero nodes in the partition).
+        let mut stab_payload = Vec::new();
+        stab_payload.extend_from_slice(&le_u32(0)); // count = 0 → global
+        let stab_hdr = make_header(
+            0x000B,
+            48 + stab_payload.len() as u32,
+            0, session_id, partition_id, 1, 1,
+        );
+        let outcome = d.process_record(&stab_hdr, &stab_payload).unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Applied { .. }),
+            "Stabilize should be Applied, got: {:?}", outcome);
+
+        // Telemetry must contain a RegionQuiescent event.
+        let events = d.runtime.telemetry.drain();
+        let rq = events.iter().find(|ev| {
+            matches!(ev, crate::telemetry::TelemetryEvent::RegionQuiescent {
+                quiescent: true, quiescent_epochs: 1, ..
+            })
+        });
+        assert!(rq.is_some(),
+            "Stabilize op must emit RegionQuiescent {{ quiescent=true, epochs=1 }}; \
+             got: {:?}", events);
+    }
+
+    #[test]
+    fn repeated_stabilize_increments_quiescent_epochs() {
+        // Multiple consecutive Stabilize ops on the same partition must increment
+        // quiescent_epochs, analogous to gated_trunk_cycles in ternary_region.sv.
+        let (mut d, session_id, path_id, partition_id) = setup_dispatcher_with_session();
+        let preamble = make_preamble(path_id, session_id);
+        d.process_preamble(&preamble).unwrap();
+        d.runtime.telemetry.drain();
+
+        let stab_payload: Vec<u8> = le_u32(0).to_vec();
+
+        for expected_epoch in 1u32..=3 {
+            let stab_hdr = make_header(
+                0x000B, 48 + stab_payload.len() as u32,
+                0, session_id, partition_id,
+                expected_epoch as u64, expected_epoch as u64,
+            );
+            d.process_record(&stab_hdr, &stab_payload).unwrap();
+
+            let events = d.runtime.telemetry.drain();
+            let rq = events.iter().find(|ev| {
+                if let crate::telemetry::TelemetryEvent::RegionQuiescent {
+                    quiescent_epochs, ..
+                } = ev {
+                    *quiescent_epochs == expected_epoch
+                } else {
+                    false
+                }
+            });
+            assert!(rq.is_some(),
+                "epoch {} must appear in RegionQuiescent; got: {:?}", expected_epoch, events);
+        }
+    }
+
+    #[test]
+    fn set_value_after_stabilize_resets_epoch_counter() {
+        // A SetValue op (region wakes) must reset the stabilize epoch counter,
+        // so the subsequent Stabilize restarts from epoch 1.
+        let (mut d, session_id, path_id, partition_id) = setup_dispatcher_with_session();
+        let preamble = make_preamble(path_id, session_id);
+        d.process_preamble(&preamble).unwrap();
+        d.runtime.telemetry.drain();
+
+        let stab_payload: Vec<u8> = le_u32(0).to_vec();
+
+        // First Stabilize → epoch 1
+        let hdr1 = make_header(0x000B, 48 + stab_payload.len() as u32,
+            0, session_id, partition_id, 1, 1);
+        d.process_record(&hdr1, &stab_payload).unwrap();
+        d.runtime.telemetry.drain();
+        assert_eq!(d.shards.stabilize_epochs(WirePartitionId(partition_id)), 1);
+
+        // Create a node so SetValue has a target
+        let node_uid: u64 = 1;
+        let mut nc_payload = Vec::new();
+        nc_payload.extend_from_slice(&le_u64(node_uid)); // node id
+        nc_payload.extend_from_slice(&le_u64(0));        // NodeKind = Computed (0)
+        nc_payload.extend_from_slice(&le_u64(0));        // ComputeRule discriminant
+        nc_payload.extend_from_slice(&le_u32(0));        // attr count = 0
+        let nc_hdr = make_header(0x0001, 48 + nc_payload.len() as u32,
+            0, session_id, partition_id, 2, 2);
+        d.process_record(&nc_hdr, &nc_payload).unwrap();
+        d.runtime.telemetry.drain();
+
+        // SetValue wakes the region — epoch counter must reset
+        let mut sv_payload = Vec::new();
+        sv_payload.extend_from_slice(&le_u64(node_uid));
+        sv_payload.push(1u8); // Pos
+        let sv_hdr = make_header(0x0003, 48 + sv_payload.len() as u32,
+            0, session_id, partition_id, 3, 3);
+        d.process_record(&sv_hdr, &sv_payload).unwrap();
+        d.runtime.telemetry.drain();
+        assert_eq!(d.shards.stabilize_epochs(WirePartitionId(partition_id)), 0,
+            "SetValue must reset stabilize epoch counter");
+
+        // Next Stabilize after wake → epoch 1 again
+        let hdr2 = make_header(0x000B, 48 + stab_payload.len() as u32,
+            0, session_id, partition_id, 4, 4);
+        d.process_record(&hdr2, &stab_payload).unwrap();
+        assert_eq!(d.shards.stabilize_epochs(WirePartitionId(partition_id)), 1,
+            "after wake+stabilize, counter must restart at 1");
     }
 
     #[test]

@@ -54,7 +54,7 @@
 //! in a single call for the remote Advisory case.
 //!
 //! **Tenant pre-registration**: remote bootstrap silently clips capabilities
-//! to `CapabilityBits::NONE` if the tenant is not registered in `DomainRegistry`.
+//! to `AuthorityPolicy::NONE` if the tenant is not registered in `DomainRegistry`.
 //! Production deployments should register tenants before accepting remote streams,
 //! or treat a missing tenant as an explicit rejection.
 //!
@@ -68,22 +68,25 @@
 //! keyed on inactivity or `causal_epoch` lag. This is not defined in v1.
 
 use rustc_hash::FxHashMap;
-use pgress_core::partition::CapabilityBits;
 use crate::{
     OpcodeClass, PathId, SessionId,
+    auth::AuthorityPolicy,
     profile::{ProfileError, SessionProfile, TrustLevel},
     runtime::{ParsedHeader, SessionRuntime},
 };
 
-const MAGIC:             &[u8; 4] = b"PGRS";
-const SUPPORTED_VERSION: u16      = 0x0003;
-const STREAM_HDR_LEN:    usize    = 32;
+const MAGIC:               &[u8; 4] = b"PGRS";
+const SUPPORTED_VERSION:   u16      = 0x0003;
+const STREAM_HDR_LEN:      usize    = 32;
 /// Actual byte count of IsaHeader fields:
 /// opcode(2)+flags(2)+length(4)+tenant_id(8)+session_id(8)+partition_id(8)+causal_epoch(8)+stream_seq(8) = 48
-const RECORD_HDR_LEN:    usize    = 48;
-const MIN_RECORD_LEN:    u32      = 48;
-const PROFILE_OPCODE:    u16      = 0x0100;
-const PROFILE_FIXED_LEN: usize    = 49;  // bytes before sig_len field
+const RECORD_HDR_LEN:      usize    = 48;
+const MIN_RECORD_LEN:      u32      = 48;
+const PROFILE_OPCODE:      u16      = 0x0100;
+/// v1 profile fixed payload length: single capability_mask (u64) before sig_len.
+const PROFILE_FIXED_LEN:   usize    = 49;
+/// v2 profile fixed payload length: four separate axis masks before sig_len.
+const PROFILE_FIXED_LEN_V2: usize   = 73;
 
 // ── StreamPreamble ────────────────────────────────────────────────────────────
 
@@ -156,6 +159,10 @@ pub enum IngressError {
     /// SessionProfile trust_level discriminant is not recognised.
     #[error("unknown trust_level byte 0x{0:02x} in SessionProfile payload")]
     UnknownTrustLevel(u8),
+
+    /// SessionProfile profile_version is not 1 or 2.
+    #[error("unknown profile_version {0} in SessionProfile payload (supported: 1, 2)")]
+    UnknownProfileVersion(u16),
 
     /// Advisory profile verification failed (expiry, generation, session mismatch).
     #[error("SessionProfile verification failed: {0}")]
@@ -342,13 +349,13 @@ impl StreamDecoder {
 
     /// Process a `SessionProfile` payload (opcode 0x0100).
     ///
-    /// Parses the payload bytes, verifies the profile (Advisory: cap scoping
-    /// only; Asserted/Attested: returns `Err(ProfileVerification(Unimplemented))`
-    /// until key infrastructure is wired), and updates the session's
-    /// `claimed_caps` in `runtime.domains`.
+    /// Parses the payload bytes (v1 single-mask or v2 four-axis), verifies the
+    /// profile (Advisory: policy scoping only; Asserted/Attested: Ed25519
+    /// signature verification against `runtime.trust_store`), and updates the
+    /// session's `claimed_policy` in `runtime.domains`.
     ///
-    /// The effective capability (`min(claimed, parent.capabilities)`) is returned
-    /// and permanently installed for subsequent authority checks on this session.
+    /// Returns the effective `AuthorityPolicy` (`claimed.intersect(parent_policy)`)
+    /// which is installed permanently for subsequent authority checks on this session.
     ///
     /// `payload` must be exactly `payload_len` bytes from the `ReadProfile`
     /// action returned by `decode_record`.
@@ -357,40 +364,41 @@ impl StreamDecoder {
         header:  &ParsedHeader,
         payload: &[u8],
         runtime: &mut SessionRuntime,
-    ) -> Result<CapabilityBits, IngressError> {
+    ) -> Result<AuthorityPolicy, IngressError> {
         let profile = parse_profile_payload(payload)?;
 
         // Locate the session and its parent tenant ceiling.
-        let (tenant_id, parent_caps) = {
+        let (tenant_id, parent_policy) = {
             let session = runtime.domains.sessions
                 .get(&header.session_id)
                 .ok_or(IngressError::UnknownSession(header.session_id))?;
             let parent = runtime.domains.tenants
                 .get(&session.tenant_id)
-                .map(|t| t.capabilities)
-                .unwrap_or(CapabilityBits::NONE);
+                .map(|t| t.policy)
+                .unwrap_or(AuthorityPolicy::NONE);
             (session.tenant_id, parent)
         };
 
         // Verify and scope the profile.
         let effective = match profile.trust_level {
             TrustLevel::Advisory => profile.verify_advisory(
-                parent_caps,
+                parent_policy,
                 header.causal_epoch,
                 0,                    // min_generation: 0 for advisory (no revocation registry)
                 header.session_id,
             )?,
             _ => profile.verify_asserted(
-                parent_caps,
+                parent_policy,
                 header.causal_epoch,
                 0,
                 header.session_id,
+                &runtime.trust_store,
             )?,
         };
 
-        // Install the effective capability on the session domain.
+        // Install the effective policy on the session domain.
         if let Some(session) = runtime.domains.sessions.get_mut(&header.session_id) {
-            session.claimed_caps = effective;
+            session.claimed_policy = effective;
         }
 
         let _ = tenant_id;
@@ -406,12 +414,14 @@ impl Default for StreamDecoder {
 
 /// Parse `SessionProfile` from raw payload bytes (opcode 0x0100 body).
 ///
-/// Wire layout (all little-endian):
+/// Supports two wire formats selected by `profile_version`:
+///
+/// **v1** (49 bytes fixed, backwards-compatible):
 /// ```text
 /// profile_id:      u32   bytes 0–3
-/// profile_version: u16   bytes 4–5
+/// profile_version: u16   bytes 4–5   (= 1)
 /// trust_level:     u8    byte  6
-/// capability_mask: u64   bytes 7–14
+/// capability_mask: u64   bytes 7–14  → mapped to all four AuthorityPolicy axes
 /// issuer_domain:   u64   bytes 15–22
 /// session_id:      u64   bytes 23–30
 /// generation:      u64   bytes 31–38
@@ -419,12 +429,27 @@ impl Default for StreamDecoder {
 /// sig_len:         u16   bytes 47–48
 /// signature:       bytes 49..49+sig_len
 /// ```
+///
+/// **v2** (73 bytes fixed, four-axis):
+/// ```text
+/// profile_id:         u32   bytes 0–3
+/// profile_version:    u16   bytes 4–5   (= 2)
+/// trust_level:        u8    byte  6
+/// assertion_mask:     u64   bytes 7–14
+/// delegation_mask:    u64   bytes 15–22
+/// observability_mask: u64   bytes 23–30
+/// disclosure_mask:    u64   bytes 31–38
+/// issuer_domain:      u64   bytes 39–46
+/// session_id:         u64   bytes 47–54
+/// generation:         u64   bytes 55–62
+/// expiry_epoch:       u64   bytes 63–70
+/// sig_len:            u16   bytes 71–72
+/// signature:          bytes 73..73+sig_len
+/// ```
 fn parse_profile_payload(payload: &[u8]) -> Result<SessionProfile, IngressError> {
-    if payload.len() < PROFILE_FIXED_LEN {
-        return Err(IngressError::ProfileTruncated {
-            needed: PROFILE_FIXED_LEN,
-            got:    payload.len(),
-        });
+    // Need at least 7 bytes to read profile_id, profile_version, trust_level.
+    if payload.len() < 7 {
+        return Err(IngressError::ProfileTruncated { needed: 7, got: payload.len() });
     }
 
     let profile_id      = u32::from_le_bytes(payload[0..4].try_into().unwrap());
@@ -432,29 +457,80 @@ fn parse_profile_payload(payload: &[u8]) -> Result<SessionProfile, IngressError>
     let trust_byte      = payload[6];
     let trust_level     = TrustLevel::from_u8(trust_byte)
         .ok_or(IngressError::UnknownTrustLevel(trust_byte))?;
-    let capability_mask = CapabilityBits(u64::from_le_bytes(payload[7..15].try_into().unwrap()));
-    let issuer_domain   = crate::TenantId(u64::from_le_bytes(payload[15..23].try_into().unwrap()));
-    let session_id      = SessionId(u64::from_le_bytes(payload[23..31].try_into().unwrap()));
-    let generation      = u64::from_le_bytes(payload[31..39].try_into().unwrap());
-    let expiry_epoch    = u64::from_le_bytes(payload[39..47].try_into().unwrap());
-    let sig_len         = u16::from_le_bytes(payload[47..49].try_into().unwrap()) as usize;
 
-    let total = PROFILE_FIXED_LEN + sig_len;
-    if payload.len() < total {
-        return Err(IngressError::ProfileTruncated { needed: total, got: payload.len() });
+    match profile_version {
+        1 => {
+            // v1: single capability_mask, mapped to all four axes
+            if payload.len() < PROFILE_FIXED_LEN {
+                return Err(IngressError::ProfileTruncated {
+                    needed: PROFILE_FIXED_LEN,
+                    got:    payload.len(),
+                });
+            }
+            let cap_mask     = u64::from_le_bytes(payload[ 7..15].try_into().unwrap());
+            let issuer_domain = crate::TenantId(u64::from_le_bytes(payload[15..23].try_into().unwrap()));
+            let session_id    = SessionId(u64::from_le_bytes(payload[23..31].try_into().unwrap()));
+            let generation    = u64::from_le_bytes(payload[31..39].try_into().unwrap());
+            let expiry_epoch  = u64::from_le_bytes(payload[39..47].try_into().unwrap());
+            let sig_len       = u16::from_le_bytes(payload[47..49].try_into().unwrap()) as usize;
+            let total         = PROFILE_FIXED_LEN + sig_len;
+            if payload.len() < total {
+                return Err(IngressError::ProfileTruncated { needed: total, got: payload.len() });
+            }
+            Ok(SessionProfile {
+                profile_id,
+                profile_version,
+                trust_level,
+                // v1 maps the single mask to all four axes — same semantics as before
+                assertion_mask:     cap_mask,
+                delegation_mask:    cap_mask,
+                observability_mask: cap_mask,
+                disclosure_mask:    cap_mask,
+                issuer_domain,
+                session_id,
+                generation,
+                expiry_epoch,
+                signature: payload[PROFILE_FIXED_LEN..total].to_vec(),
+            })
+        },
+        2 => {
+            // v2: four separate axis masks
+            if payload.len() < PROFILE_FIXED_LEN_V2 {
+                return Err(IngressError::ProfileTruncated {
+                    needed: PROFILE_FIXED_LEN_V2,
+                    got:    payload.len(),
+                });
+            }
+            let assertion_mask     = u64::from_le_bytes(payload[ 7..15].try_into().unwrap());
+            let delegation_mask    = u64::from_le_bytes(payload[15..23].try_into().unwrap());
+            let observability_mask = u64::from_le_bytes(payload[23..31].try_into().unwrap());
+            let disclosure_mask    = u64::from_le_bytes(payload[31..39].try_into().unwrap());
+            let issuer_domain      = crate::TenantId(u64::from_le_bytes(payload[39..47].try_into().unwrap()));
+            let session_id         = SessionId(u64::from_le_bytes(payload[47..55].try_into().unwrap()));
+            let generation         = u64::from_le_bytes(payload[55..63].try_into().unwrap());
+            let expiry_epoch       = u64::from_le_bytes(payload[63..71].try_into().unwrap());
+            let sig_len            = u16::from_le_bytes(payload[71..73].try_into().unwrap()) as usize;
+            let total              = PROFILE_FIXED_LEN_V2 + sig_len;
+            if payload.len() < total {
+                return Err(IngressError::ProfileTruncated { needed: total, got: payload.len() });
+            }
+            Ok(SessionProfile {
+                profile_id,
+                profile_version,
+                trust_level,
+                assertion_mask,
+                delegation_mask,
+                observability_mask,
+                disclosure_mask,
+                issuer_domain,
+                session_id,
+                generation,
+                expiry_epoch,
+                signature: payload[PROFILE_FIXED_LEN_V2..total].to_vec(),
+            })
+        },
+        other => Err(IngressError::UnknownProfileVersion(other)),
     }
-
-    Ok(SessionProfile {
-        profile_id,
-        profile_version,
-        trust_level,
-        capability_mask,
-        issuer_domain,
-        session_id,
-        generation,
-        expiry_epoch,
-        signature: payload[PROFILE_FIXED_LEN..total].to_vec(),
-    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -462,9 +538,10 @@ fn parse_profile_payload(payload: &[u8]) -> Result<SessionProfile, IngressError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgress_core::partition::{AuthorityMode, CapabilityBits};
+    use pgress_core::partition::AuthorityMode;
     use crate::{
         WirePartitionId, TenantId,
+        auth::AuthorityPolicy,
         domain::{SessionDomain, SessionQuota, TenantDomain, TenantQuota},
         session::{PathEntry, PathState},
     };
@@ -497,17 +574,22 @@ mod tests {
     fn minimal_runtime() -> SessionRuntime {
         let mut rt = SessionRuntime::new();
         rt.domains.tenants.insert(TenantId(1), TenantDomain {
-            id: TenantId(1), capabilities: CapabilityBits::ALL, quota: TenantQuota::default(),
+            id: TenantId(1), policy: AuthorityPolicy::ALL, quota: TenantQuota::default(),
         });
         rt.domains.sessions.insert(SessionId(10), SessionDomain {
             id: SessionId(10), tenant_id: TenantId(1),
-            claimed_caps: CapabilityBits::ALL, auth_mode: AuthorityMode::Advisory,
+            claimed_policy: AuthorityPolicy::ALL, auth_mode: AuthorityMode::Advisory,
             quota: SessionQuota::default(),
         });
         rt.sessions.create(crate::session::SessionEntry {
-            session_id: SessionId(10), tenant_id: TenantId(1),
-            active_path_id: Some(crate::PathId(42)), prev_path_id: None,
-            stream_seq_floor: 0, auth_mode: AuthorityMode::Advisory,
+            session_id:                   SessionId(10),
+            tenant_id:                    TenantId(1),
+            active_path_id:               Some(crate::PathId(42)),
+            prev_path_id:                 None,
+            stream_seq_floor:             0,
+            auth_mode:                    AuthorityMode::Advisory,
+            last_active_causal_epoch:     0,
+            consecutive_quiescent_epochs: 0,
         });
         rt.paths.create(PathEntry {
             path_id: crate::PathId(42), session_id: SessionId(10),
@@ -691,8 +773,29 @@ mod tests {
 
     #[test]
     fn profile_truncated_payload_rejected() {
-        let err = parse_profile_payload(&[0u8; 10]).unwrap_err();
-        assert!(matches!(err, IngressError::ProfileTruncated { needed: 49, .. }));
+        // 10 bytes — not even enough to read profile_id + profile_version + trust_level (7 bytes
+        // minimum). The parser catches this before reaching any version branch.
+        let err_short = parse_profile_payload(&[0u8; 6]).unwrap_err();
+        assert!(matches!(err_short, IngressError::ProfileTruncated { needed: 7, .. }),
+            "6-byte payload must be rejected before version branch; got: {:?}", err_short);
+
+        // 20 bytes — valid v1 header (profile_version=1, trust_level=Advisory) but
+        // shorter than the 49-byte v1 fixed length. Must be rejected with ProfileTruncated.
+        let mut p20 = [0u8; 20];
+        p20[4..6].copy_from_slice(&1u16.to_le_bytes()); // profile_version = 1
+        p20[6] = 0x01;                                   // trust_level = Advisory
+        let err_v1 = parse_profile_payload(&p20).unwrap_err();
+        assert!(matches!(err_v1, IngressError::ProfileTruncated { needed: 49, .. }),
+            "20-byte v1 payload must be ProfileTruncated {{ needed: 49 }}; got: {:?}", err_v1);
+
+        // 30 bytes — valid v2 header (profile_version=2, trust_level=Advisory) but
+        // shorter than the 73-byte v2 fixed length.
+        let mut p30 = [0u8; 30];
+        p30[4..6].copy_from_slice(&2u16.to_le_bytes()); // profile_version = 2
+        p30[6] = 0x01;                                   // trust_level = Advisory
+        let err_v2 = parse_profile_payload(&p30).unwrap_err();
+        assert!(matches!(err_v2, IngressError::ProfileTruncated { needed: 73, .. }),
+            "30-byte v2 payload must be ProfileTruncated {{ needed: 73 }}; got: {:?}", err_v2);
     }
 
     #[test]
@@ -707,8 +810,8 @@ mod tests {
     fn process_profile_clips_caps_to_parent() {
         let mut dec = StreamDecoder::new();
         let mut rt  = minimal_runtime();
-        // Tenant only has READ capability
-        rt.domains.tenants.get_mut(&TenantId(1)).unwrap().capabilities = CapabilityBits::READ;
+        // Tenant only has READ_ONLY policy (observability + disclosure, no assertion/delegation)
+        rt.domains.tenants.get_mut(&TenantId(1)).unwrap().policy = AuthorityPolicy::READ_ONLY;
 
         dec.decode_preamble(&valid_preamble()).unwrap();
         let hdr = ParsedHeader {
@@ -717,12 +820,12 @@ mod tests {
             partition_id: WirePartitionId(0), causal_epoch: 0, stream_seq: 1,
         };
 
-        // Profile claims ALL — should be clipped to READ
+        // Profile claims ALL — should be clipped to READ_ONLY
         let payload = advisory_payload(10, u64::MAX);
         let effective = dec.process_profile(&hdr, &payload, &mut rt).unwrap();
-        assert_eq!(effective, CapabilityBits::READ);
-        // Verify the session's claimed_caps was updated
-        assert_eq!(rt.domains.sessions[&SessionId(10)].claimed_caps, CapabilityBits::READ);
+        assert_eq!(effective, AuthorityPolicy::READ_ONLY);
+        // Verify the session's claimed_policy was updated
+        assert_eq!(rt.domains.sessions[&SessionId(10)].claimed_policy, AuthorityPolicy::READ_ONLY);
     }
 
     #[test]

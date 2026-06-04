@@ -281,6 +281,21 @@ impl VectorClock {
     pub fn dominates(&self, other: &VectorClock) -> bool {
         other.0.iter().all(|(&p, &v)| self.get(p) >= v)
     }
+
+    /// Iterate over all (partition, clock) entries.
+    ///
+    /// Used by the wire encoder to serialise the frontier. The order is
+    /// unspecified (hash map order); callers that require deterministic output
+    /// should sort the result by `PartitionId::as_u128()`.
+    pub fn iter(&self) -> impl Iterator<Item = (&PartitionId, &u64)> {
+        self.0.iter()
+    }
+
+    /// Number of partitions tracked in this clock.
+    pub fn len(&self) -> usize { self.0.len() }
+
+    /// True if no partitions have been tracked yet.
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

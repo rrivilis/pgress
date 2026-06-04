@@ -4,8 +4,21 @@ version     = "0.1.0"
 edition     = "2021"
 description = "pgress session manager — domain hierarchy, auth gate, admission, telemetry"
 
+[features]
+## Expose the deterministic simulation harness in non-test builds.
+## Always compiled in `cfg(test)`. Enable for chaos/integration test binaries.
+sim = []
+
 [dependencies]
-pgress-core = { path = "../core-rs" }
-rustc-hash  = "2"
-thiserror   = "1"
-smallvec    = { version = "1", features = ["const_generics"] }
+pgress-core   = { path = "../core-rs" }
+rustc-hash    = "2"
+thiserror     = "1"
+smallvec      = { version = "1", features = ["const_generics"] }
+ed25519-dalek = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "boundary"
+harness = false

@@ -2,7 +2,7 @@
 
 > **Audience:** Integrators wiring pgress into a host application or network service.
 > This document covers the high/low split, the Dispatcher pattern, end-to-end
-> pipeline, bootstrap semantics, and known v1 gaps.
+> pipeline, bootstrap semantics, and known gaps.
 
 ---
 
@@ -23,7 +23,7 @@ pub struct Dispatcher {
 }
 
 // EnginePool is a HashMap<ShardId, Engine> with get-or-create semantics.
-// In v1 all partitions route to ShardId(0) (single bootstrap shard).
+// Currently all partitions route to ShardId(0) (single bootstrap shard).
 // Multi-shard placement is a future enhancement.
 ```
 
@@ -48,7 +48,7 @@ raw bytes (TCP / QUIC / file)
   │
   ├─ [if ReadProfile]
   │    StreamDecoder::process_profile(&header, payload, &mut runtime)
-  │      → clips capability to tenant ceiling
+  │      → clips policy to tenant ceiling (all four axes)
   │      → creates/updates session in runtime.domains
   │      → registers path in runtime.paths  [bootstrap path]
   │
@@ -96,12 +96,14 @@ The host creates sessions directly before any stream arrives:
 
 ```rust
 runtime.sessions.create(SessionEntry {
-    session_id:       SessionId(id),
-    tenant_id:        TenantId(tenant),
-    active_path_id:   Some(PathId(path)),
-    prev_path_id:     None,
-    stream_seq_floor: 0,
-    auth_mode:        AuthorityMode::Advisory,
+    session_id:                   SessionId(id),
+    tenant_id:                    TenantId(tenant),
+    active_path_id:               Some(PathId(path)),
+    prev_path_id:                 None,
+    stream_seq_floor:             0,
+    auth_mode:                    AuthorityMode::Advisory,
+    last_active_causal_epoch:     0,
+    consecutive_quiescent_epochs: 0,
 });
 runtime.paths.create(PathEntry {
     path_id:             PathId(path),
@@ -113,7 +115,7 @@ runtime.paths.create(PathEntry {
 
 Session is immediately `Active`. No wire handshake required.
 
-### Remote bootstrap (Advisory, v1)
+### Remote bootstrap (Advisory and Asserted)
 
 The peer sends opcode `0x0100` (`SessionProfile`) as the first record on a
 fresh path. `process_profile` creates the session and registers the path:
@@ -129,9 +131,23 @@ subsequent records admitted normally
 ```
 
 **Tenant must be pre-registered.** If `TenantId` from the profile is not in
-`runtime.domains.tenants`, capabilities are silently clipped to `NONE`.
+`runtime.domains.tenants`, all four policy axes are silently clipped to `NONE`.
 Production deployments should register tenants before accepting remote streams
 or explicitly reject on missing tenant.
+
+**ASSERTED paths.** If `trust_level = 0x02`, `process_profile` calls
+`verify_asserted` before creating or updating the session. `verify_asserted`
+looks up the issuer's `VerifyingKey` from `runtime.trust_store` and verifies the
+Ed25519 signature over the 64-byte canonical payload:
+`assertion_mask ‖ delegation_mask ‖ observability_mask ‖ disclosure_mask ‖
+issuer_domain ‖ session_id ‖ generation ‖ expiry_epoch` (all little-endian, 8
+bytes each). A missing key in `trust_store` is treated as a verification failure.
+The session is not created until verification succeeds; a failed ASSERTED profile
+returns `IngressError::SignatureVerificationFailed`. Add issuer keys via:
+
+```rust
+runtime.trust_store.insert(TenantId(issuer_id), verifying_key);
+```
 
 **Re-bootstrap with existing session_id** (reconnect on new path): if
 `process_profile` finds the session already `Active`, register the new path
@@ -143,30 +159,25 @@ and update `active_path_id` — do not recreate the session. The existing
 | Reason                | Meaning                                                      |
 |-----------------------|--------------------------------------------------------------|
 | `SessionNotFound`     | No session registered — hello not yet received or rejected   |
-| `UnauthenticatedPath` | Session exists but path admission pending (ASSERTED, post-v1)|
+| `UnauthenticatedPath` | Session exists but path admission pending (ASSERTED path awaiting verification) |
 
 A client receiving `SessionNotFound` should send a `SessionProfile` hello.
 A client receiving `UnauthenticatedPath` should wait for bootstrap to complete.
 
 ---
 
-## Trust levels (v1 scope)
+## Trust levels
 
-| Level      | v1 status         | What's needed to complete                                     |
+| Level      | Status            | Notes                                                         |
 |------------|-------------------|---------------------------------------------------------------|
-| ADVISORY   | Production-ready  | —                                                             |
-| ASSERTED   | Stub (`Unimplemented`) | `trust_store: HashMap<TenantId, VerifyingKey>` in `SessionRuntime`; `ed25519-dalek` or `ring`; call `VerifyingKey::verify()` in `verify_asserted` over canonical payload `capability_mask ‖ issuer_domain ‖ session_id ‖ generation ‖ expiry_epoch` |
-| ATTESTED   | Post-v1           | Stream key exchange during bootstrap; per-record MAC          |
+| ADVISORY   | Production-ready  | No signature; policy clipped to parent tenant ceiling on all four axes |
+| ASSERTED   | Production-ready  | Ed25519 over 64-byte canonical payload (four-mask form); `trust_store: FxHashMap<TenantId, VerifyingKey>` is a field of `SessionRuntime`; generation-based revocation is O(1) |
+| ATTESTED   | Not yet implemented | Stream key exchange during bootstrap; per-record MAC required |
 
 ---
 
-## Known v1 gaps
+## Known gaps
 
-| Gap                         | Impact                                        | Notes                                      |
-|-----------------------------|-----------------------------------------------|--------------------------------------------|
-| Session expiry / tombstoning | Sessions live indefinitely in `SessionTable`  | Implement reaping on inactivity or epoch lag |
-| Multi-shard placement       | All partitions route to `ShardId(0)`          | `EnginePool` supports N shards; placement logic is the gap |
-| Telemetry / topology as ring buffer | Not a first-class engine partition yet | Interface is forward-compatible; migration is non-breaking |
-| ASSERTED verification stub  | Cross-tenant federation not enforced          | See trust level table above                |
-| ATTESTED post-v1            | Stream MAC not implemented                    | Requires bootstrap key exchange            |
-| `DepKind::Remote` wire encoding | Cross-partition edges not decodable from wire | `parse_payload` returns `RemoteDepNotSupported`; full encoding is a future ABI revision |
+| Gap      | Impact                          | Notes                                                       |
+|----------|---------------------------------|-------------------------------------------------------------|
+| ATTESTED | Stream MAC not implemented      | Requires bootstrap key exchange; per-record MAC under derived session key |

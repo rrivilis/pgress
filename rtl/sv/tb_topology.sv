@@ -2,9 +2,10 @@
 //
 // Topology stabilization benchmark testbench.
 //
-// Instantiates two DUTs:
+// Instantiates three DUTs:
 //   1. ternary_chain  (K=8, FAN_IN=4, RULE=MeetAll)
 //   2. ternary_tree   (LEVELS=4, FANOUT=2, LEAF_FAN=4, RULE=MeetAll)
+//   3. ternary_region (K=8, FAN_IN=4, RULE=MeetAll) — chain with region-level ICG
 //
 // Scenarios
 //   TC1 -- Chain: Zero injected at stage-0 input, propagates 8 stages.
@@ -24,6 +25,15 @@
 //          Quiescence in LEVELS-1 = 3 cycles.
 //
 //   TT3 -- Tree no-op: re-drive same Pos values, ce_out must stay 0 globally.
+//
+//   TC4 -- Region ICG: Zero injected at stage-0, propagates through chain.
+//          Once all stages reach Zero, quiescent asserts → ICG gates gclk.
+//          gclk_active drops and gated_trunk_cycles accumulates on the always-on
+//          trunk clock.  Proves: semantic quiescence → physical clock quiescence.
+//
+//   TC5 -- Region wake: while region is clock-gated (frustration isolated),
+//          inject a new input change.  Region wakes: gclk resumes, chain updates
+//          and re-quiesces.  Proves: ICG gate is self-clearing, not permanent.
 //
 // Timing (4 ns clock / 250 MHz):
 //   quiescent_age is counted and compared against the expected cycle depth.
@@ -94,6 +104,35 @@ module tb_topology;
         .quiescent_age(tr_age)
     );
 
+    // ── Region DUT (ternary_chain with region-level ICG) ──────────────────────
+    localparam integer RG_K   = CH_K;
+    localparam integer RG_FAN = CH_FAN;
+    localparam integer RG_SIDE_W = RG_K * (RG_FAN - 1) * 2;
+
+    reg  [RG_FAN*2-1:0]    rg_in    = '0;
+    reg  [RG_SIDE_W-1:0]   rg_side  = '0;
+    wire [RG_K*2-1:0]      rg_stage_out;
+    wire [RG_K-1:0]        rg_stage_ce;
+    wire                   rg_quiescent;
+    wire [12:0]            rg_quiescent_age;
+    wire                   rg_gclk;
+    wire                   rg_gclk_active;
+    wire [12:0]            rg_gated_cycles;
+
+    ternary_region #(.K(RG_K), .FAN_IN(RG_FAN), .RULE(0)) region_dut (
+        .clk               (clk),
+        .rst               (rst),
+        .chain_in          (rg_in),
+        .side_in           (rg_side),
+        .stage_out         (rg_stage_out),
+        .stage_ce          (rg_stage_ce),
+        .quiescent         (rg_quiescent),
+        .quiescent_age     (rg_quiescent_age),
+        .gclk              (rg_gclk),
+        .gclk_active       (rg_gclk_active),
+        .gated_trunk_cycles(rg_gated_cycles)
+    );
+
     // ── Helpers ───────────────────────────────────────────────────────────────
     integer tb_failures = 0;
     integer cycles_waited;
@@ -125,6 +164,20 @@ module tb_topology;
         end
     endtask
 
+    // Wait for rg_quiescent using the always-on trunk clock.
+    // rg_quiescent is combinational and valid even when rg_gclk is dark.
+    task automatic wait_quiescent_rg(input integer max_wait);
+        integer c;
+        cycles_waited = -1;
+        for (c = 0; c < max_wait; c++) begin
+            @(posedge clk); #1;
+            if (rg_quiescent) begin
+                cycles_waited = c + 1;
+                c = max_wait;   // break
+            end
+        end
+    endtask
+
     // Set all leaf inputs of the tree to a 2-bit ternary value.
     task automatic tree_set_all(input [1:0] val);
         tr_leaf_in = {TR_IN_W/2{val}};
@@ -142,6 +195,8 @@ module tb_topology;
         ch_in   = '0;          // all Neg
         ch_side = '0;
         tr_leaf_in = '0;
+        rg_in   = '0;
+        rg_side = '0;
         repeat (4) @(posedge clk);
         #1; rst = 0;
 
@@ -305,13 +360,119 @@ module tb_topology;
                 tb_failures++;
         end
 
+        $display("");
+
+        // ════════════════════════════════════════════════════════════════════
+        // REGION ICG SCENARIOS (ternary_region — chain + region-level ICG)
+        // ════════════════════════════════════════════════════════════════════
+
+        // ── TC4: Region ICG — Zero frustration locks clock trunk ──────────────
+        // Drive all Pos, wait for region quiescence, then inject Zero.
+        // After K stages propagate, region quiescent asserts → ICG darkens gclk.
+        // Verify gclk_active drops and gated_trunk_cycles accumulates.
+
+        rg_side = {RG_SIDE_W/2{2'b01}};   // all side inputs Pos
+        rg_in   = {RG_FAN{2'b01}};        // all Pos
+        wait_quiescent_rg(20);
+        if (rg_stage_out[1:0] !== 2'b01) begin
+            $display("FAIL TC4-setup: region did not reach Pos baseline after %0d cycles",
+                     cycles_waited);
+            tb_failures++;
+        end
+
+        // Inject Zero at stage-0 input slot 0
+        rg_in[1:0] = 2'b10;   // Zero
+        t0 = $time;
+        wait_quiescent_rg(20);
+        t1 = $time;
+
+        if (cycles_waited < 0) begin
+            $display("FAIL TC4a: region never quiesced after Zero injection");
+            tb_failures++;
+        end else if (rg_stage_out[1:0] !== 2'b10) begin
+            $display("FAIL TC4a: stage[0]=%02b (expected Zero) after %0d cycles",
+                     rg_stage_out[1:0], cycles_waited);
+            tb_failures++;
+        end else begin
+            $display("TC4a (region Zero propagation, K=%0d): PASS  |  %0d cycles  |  %0d ns",
+                     RG_K, cycles_waited, t1 - t0);
+        end
+
+        // Allow the ICG latch to capture gate_enable=0 (1 CLK cycle after quiescence).
+        // Then verify gclk_active has dropped and gclk is dark.
+        repeat (3) @(posedge clk); #1;
+
+        if (rg_gclk_active !== 1'b0) begin
+            $display("FAIL TC4b: gclk_active still 1 three trunk cycles after quiescence");
+            tb_failures++;
+        end else begin
+            $display("TC4b (gclk gated after quiescence):    PASS  |  gclk_active=%0b",
+                     rg_gclk_active);
+        end
+
+        // Verify gated_trunk_cycles is accumulating on the always-on CLK
+        if (rg_gated_cycles < 3) begin
+            $display("FAIL TC4c: gated_trunk_cycles=%0d (expected >= 3)", rg_gated_cycles);
+            tb_failures++;
+        end else begin
+            $display("TC4c (trunk cycles banked while gclk dark): PASS  |  gated_trunk_cycles=%0d",
+                     rg_gated_cycles);
+        end
+
+        // ── TC5: Wake from quiescence — input change resumes gclk ─────────────
+        // While region is clock-gated, change rg_in back to Pos.
+        // comb_out diverges from out → quiescent drops → gate_enable rises →
+        // ICG re-opens → gclk resumes → chain updates → re-quiesces at Pos.
+
+        rg_in = {RG_FAN{2'b01}};   // all Pos (change while gclk is dark)
+        // quiescent must drop immediately (comb_out now Pos, out still Zero)
+        @(posedge clk); #1;
+        if (rg_quiescent !== 1'b0) begin
+            $display("FAIL TC5a: quiescent did not drop on input change (comb path broken)");
+            tb_failures++;
+        end else begin
+            $display("TC5a (quiescent drops on input change): PASS  |  quiescent=%0b",
+                     rg_quiescent);
+        end
+
+        // Wait for region to re-quiesce at Pos
+        t0 = $time;
+        wait_quiescent_rg(20);
+        t1 = $time;
+
+        if (cycles_waited < 0) begin
+            $display("FAIL TC5b: region never re-quiesced after wake");
+            tb_failures++;
+        end else if (rg_stage_out[1:0] !== 2'b01) begin
+            $display("FAIL TC5b: stage[0]=%02b after wake (expected Pos)", rg_stage_out[1:0]);
+            tb_failures++;
+        end else begin
+            $display("TC5b (region wakes and re-quiesces at Pos): PASS  |  %0d cycles  |  %0d ns",
+                     cycles_waited, t1 - t0);
+        end
+
+        // gated_trunk_cycles must have reset to 0 during the active phase
+        // (it counts only while quiescent=1; wakeup sets quiescent=0 → counter resets)
+        if (rg_gated_cycles !== 13'd0) begin
+            $display("FAIL TC5c: gated_trunk_cycles=%0d after wake (expected 0 during active)",
+                     rg_gated_cycles);
+            tb_failures++;
+        end else begin
+            $display("TC5c (gated_trunk_cycles resets on wake):   PASS  |  gated_trunk_cycles=%0d",
+                     rg_gated_cycles);
+        end
+
         // ── Summary ───────────────────────────────────────────────────────────
         $display("");
         $display("Topology benchmark complete.");
-        $display("Chain (K=%0d, FAN=%0d): propagation depth = %0d cycles = %0d ns @ 250 MHz",
+        $display("Chain  (K=%0d, FAN=%0d): propagation depth = %0d cycles = %0d ns @ 250 MHz",
                  CH_K, CH_FAN, CH_K, CH_K * 4);
-        $display("Tree  (L=%0d, FO=%0d): propagation depth = %0d cycles = %0d ns @ 250 MHz",
+        $display("Tree   (L=%0d, FO=%0d): propagation depth = %0d cycles = %0d ns @ 250 MHz",
                  TR_LEVELS, TR_FANOUT, TR_LEVELS - 1, (TR_LEVELS - 1) * 4);
+        $display("Region (K=%0d, ICG):    semantic quiescence → gclk gated (trunk banked)",
+                 RG_K);
+        $display("  gclk_active after frustration: %0b (0=gated)", rg_gclk_active);
+        $display("  gated_trunk_cycles at end:      %0d", rg_gated_cycles);
         $display("");
         $display("CGRA vs FPGA projection (same RTL, different clock):");
         $display("  FPGA  @ 300 MHz (3.33 ns): chain=%0d ns, tree=%0d ns",

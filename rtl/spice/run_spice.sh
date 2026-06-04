@@ -11,7 +11,7 @@
 #       open_pdks install    (/usr/local/share/pdk/sky130A/...)
 #
 # Usage:
-#   ./rtl/spice/run_spice.sh [t_class | t_dff | t_zero | all]
+#   ./rtl/spice/run_spice.sh [t_class | t_dff | t_zero | t_class_custom | t_zero_icg | t_dff_comparison | all]
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,21 +99,29 @@ run_deck() {
         tail -n +2 "$resolved"
     } > "/tmp/${name}_final.spice"
     ngspice -b -o "$out" "/tmp/${name}_final.spice" 2>&1 | \
-        grep -E "tpd_|power_|ratio_|isolation_|ce_eff_|measure|Error|Warning" || true
+        grep -E "tpd_|power_|ratio_|isolation_|ce_eff_|gclk_|measure|Error|Warning" || true
     echo "Full output: $out"
 }
 
 TARGET="${1:-all}"
 case "$TARGET" in
-    t_class) run_deck t_class ;;
-    t_dff)   run_deck t_dff ;;
-    t_zero)  run_deck t_zero ;;
+    t_class)           run_deck t_class ;;
+    t_dff)             run_deck t_dff ;;
+    t_zero)            run_deck t_zero ;;
+    t_class_custom)    run_deck t_class_custom ;;
+    t_zero_icg)        run_deck t_zero_icg ;;
+    t_dff_comparison)  run_deck t_dff_comparison ;;
+    t_region_icg)      run_deck t_region_icg ;;
     all)
         run_deck t_class
         run_deck t_dff
         run_deck t_zero
+        run_deck t_class_custom
+        run_deck t_zero_icg
+        run_deck t_dff_comparison
+        run_deck t_region_icg
         ;;
-    *) echo "Usage: $0 [t_class | t_dff | t_zero | all]"; exit 1 ;;
+    *) echo "Usage: $0 [t_class | t_dff | t_zero | t_class_custom | t_zero_icg | t_dff_comparison | t_region_icg | all]"; exit 1 ;;
 esac
 
 echo ""

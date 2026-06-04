@@ -109,6 +109,43 @@ pub enum TelemetryEvent {
         shard_id: ShardId,
         addr:     ShardFabricAddr,
     },
+
+    // ── Ternary quiescence hierarchy (maps to hardware ICG levels) ────────────
+
+    /// A single ternary cell entered or exited the Zero (frustrated) state.
+    ///
+    /// Maps to the cell-level ICG: `is_at_zero = Q_p1 & ~Q_p0`.
+    /// Ternary encoding: `quiescent=true` → Zero state (clock dark);
+    ///                   `quiescent=false` → Pos/Neg state (clock running).
+    ///
+    /// In the telemetry partition, the corresponding node is named
+    /// `cell::{cell_id}::is_at_zero` and carries a ternary value where
+    /// Zero means "cell is at hardware Zero / frustrated".
+    CellQuiescent {
+        cell_id:      Uid,
+        partition_id: WirePartitionId,
+        /// True when the cell entered Zero state; false when it recovered.
+        quiescent:    bool,
+    },
+
+    /// A region (group of ternary cells) reached or left the quiescent state.
+    ///
+    /// Maps to the region-level ICG: `quiescent = NOR(ce_out[0..K-1])`.
+    /// When `quiescent=true`, all cells in the region are at their fixed point
+    /// and the region clock is gated off.
+    ///
+    /// In the telemetry partition, the corresponding node is named
+    /// `region::{region_root}::quiescent` and carries a ternary value where
+    /// Zero means "region clock is dark".
+    RegionQuiescent {
+        region_root:  Uid,
+        partition_id: WirePartitionId,
+        /// True when the region reached global quiescence; false on wake.
+        quiescent:    bool,
+        /// Consecutive epochs spent quiescent. Analogous to `gated_trunk_cycles`
+        /// in the RTL. Resets to zero on wake. Saturates at `u32::MAX`.
+        quiescent_epochs: u32,
+    },
 }
 
 // ── TelemetryNodeName ─────────────────────────────────────────────────────────
@@ -152,6 +189,33 @@ impl TelemetryNodeName {
     /// `shard::{id}::placement_coords` — fabric address (region/pod/rack/leaf).
     pub fn placement_coords(shard: ShardId) -> String {
         format!("shard::{}::placement_coords", shard.0)
+    }
+
+    // ── Quiescence hierarchy (three-level ICG analog) ─────────────────────────
+
+    /// `cell::{uid}::is_at_zero` — cell-level ICG telemetry node.
+    ///
+    /// Ternary value: Zero = cell is at hardware-Zero (frustrated / clock dark);
+    /// Pos = cell is active (Pos or Neg state, clock running); Neg = unknown.
+    pub fn cell_is_at_zero(uid: Uid) -> String {
+        format!("cell::{}::is_at_zero", uid)
+    }
+
+    /// `region::{root}::quiescent` — region-level ICG telemetry node.
+    ///
+    /// Ternary value: Zero = region clock is dark (all cells quiescent);
+    /// Pos = region active; Neg = unknown / transitioning.
+    pub fn region_quiescent(root: Uid) -> String {
+        format!("region::{}::quiescent", root)
+    }
+
+    /// `domain::{pid}::all_quiescent` — domain-level (all-partitions) quiescence.
+    ///
+    /// Ternary value: Zero = all partitions in this domain have empty
+    /// propagation queues AND all cells are at their fixed points (full domain
+    /// quiescence); Pos = active; Neg = unknown.
+    pub fn domain_all_quiescent(pid: WirePartitionId) -> String {
+        format!("domain::{}::all_quiescent", pid.0)
     }
 }
 

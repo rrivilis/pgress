@@ -23,8 +23,8 @@
 //! `DomainRegistry::effective_caps` enforces this at the session level.
 
 use rustc_hash::FxHashMap;
-use pgress_core::partition::{AuthorityMode, CapabilityBits, LatticeClass};
-use crate::{SessionId, ShardId, TenantId, WirePartitionId};
+use pgress_core::partition::{AuthorityMode, LatticeClass};
+use crate::{auth::AuthorityPolicy, SessionId, ShardId, TenantId, WirePartitionId};
 
 // ── ShardFabricAddr ───────────────────────────────────────────────────────────
 
@@ -136,23 +136,23 @@ impl Default for SessionQuota {
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
-/// Outermost isolation boundary. Sets the capability ceiling for all child sessions.
+/// Outermost isolation boundary. Sets the authority ceiling for all child sessions.
 #[derive(Clone, Debug)]
 pub struct TenantDomain {
-    pub id:           TenantId,
-    /// Hard ceiling on capabilities for all sessions under this tenant.
-    /// Child sessions cannot claim capabilities the tenant does not hold.
-    pub capabilities: CapabilityBits,
-    pub quota:        TenantQuota,
+    pub id:     TenantId,
+    /// Hard authority ceiling for all sessions under this tenant.
+    /// Child sessions cannot claim authority the tenant does not hold on any axis.
+    pub policy: AuthorityPolicy,
+    pub quota:  TenantQuota,
 }
 
 impl TenantDomain {
-    /// Default single-tenant domain: all capabilities, generous quota.
+    /// Default single-tenant domain: full authority on all axes, generous quota.
     pub fn single_tenant() -> Self {
         TenantDomain {
-            id:           TenantId(0),
-            capabilities: CapabilityBits::ALL,
-            quota:        TenantQuota::default(),
+            id:     TenantId(0),
+            policy: AuthorityPolicy::ALL,
+            quota:  TenantQuota::default(),
         }
     }
 }
@@ -160,13 +160,13 @@ impl TenantDomain {
 /// Transient connection context. Stable logical identity across path migrations.
 #[derive(Clone, Debug)]
 pub struct SessionDomain {
-    pub id:           SessionId,
-    pub tenant_id:    TenantId,
-    /// Capability claimed by this session (e.g. from SessionProfile).
-    /// Effective capability = min(claimed_caps, tenant.capabilities).
-    pub claimed_caps: CapabilityBits,
-    pub auth_mode:    AuthorityMode,
-    pub quota:        SessionQuota,
+    pub id:             SessionId,
+    pub tenant_id:      TenantId,
+    /// Authority claimed by this session (e.g. from SessionProfile).
+    /// Effective authority = claimed_policy.intersect(tenant.policy).
+    pub claimed_policy: AuthorityPolicy,
+    pub auth_mode:      AuthorityMode,
+    pub quota:          SessionQuota,
 }
 
 /// Causal isolation unit. Owns PartitionAuthTable scope and shard assignment.
@@ -221,22 +221,22 @@ impl DomainRegistry {
         self.shards.insert(s.id, s);
     }
 
-    /// Effective capabilities for a session.
+    /// Effective authority policy for a session.
     ///
-    /// Returns `min(session.claimed_caps, tenant.capabilities)` — the child
-    /// can never exceed the parent ceiling.
+    /// Returns `claimed_policy.intersect(tenant.policy)` — the child can never
+    /// exceed the parent ceiling on any axis.
     /// Returns `None` if the session or its parent tenant is not registered.
-    pub fn effective_caps(&self, session_id: SessionId) -> Option<CapabilityBits> {
+    pub fn effective_policy(&self, session_id: SessionId) -> Option<AuthorityPolicy> {
         let session = self.sessions.get(&session_id)?;
         let tenant  = self.tenants.get(&session.tenant_id)?;
-        Some(CapabilityBits(session.claimed_caps.0 & tenant.capabilities.0))
+        Some(session.claimed_policy.intersect(tenant.policy))
     }
 
-    /// True if the session holds `required` capabilities after applying the
-    /// parent ceiling. False if session or tenant not found.
-    pub fn session_allows(&self, session_id: SessionId, required: CapabilityBits) -> bool {
-        self.effective_caps(session_id)
-            .map(|eff| eff.allows(required))
+    /// True if the session holds the required policy (as a sub-policy) after
+    /// applying the parent ceiling. False if session or tenant not found.
+    pub fn session_allows(&self, session_id: SessionId, required: AuthorityPolicy) -> bool {
+        self.effective_policy(session_id)
+            .map(|eff| required.is_bounded_by(eff))
             .unwrap_or(false)
     }
 
@@ -283,61 +283,70 @@ mod tests {
 
     fn make_registry() -> DomainRegistry {
         let mut r = DomainRegistry::new();
+        // Tenant has assertion + observability but NOT delegation or disclosure
         r.register_tenant(TenantDomain {
-            id:           TenantId(1),
-            capabilities: CapabilityBits::READ | CapabilityBits::PROPAGATE,
-            quota:        TenantQuota::default(),
+            id:     TenantId(1),
+            policy: AuthorityPolicy {
+                assertion:     0xFF,
+                delegation:    0x00,
+                observability: 0xFF,
+                disclosure:    0x00,
+            },
+            quota: TenantQuota::default(),
         });
         r.register_session(SessionDomain {
-            id:           SessionId(10),
-            tenant_id:    TenantId(1),
-            claimed_caps: CapabilityBits::ALL,   // claims everything
-            auth_mode:    AuthorityMode::Advisory,
-            quota:        SessionQuota::default(),
+            id:             SessionId(10),
+            tenant_id:      TenantId(1),
+            claimed_policy: AuthorityPolicy::ALL,   // claims everything
+            auth_mode:      AuthorityMode::Advisory,
+            quota:          SessionQuota::default(),
         });
         r
     }
 
     #[test]
-    fn effective_caps_clips_to_parent() {
+    fn effective_policy_clips_to_parent_ceiling() {
         let r = make_registry();
-        // Session claims ALL but tenant only grants READ | PROPAGATE
-        let eff = r.effective_caps(SessionId(10)).unwrap();
-        let expected = CapabilityBits::READ | CapabilityBits::PROPAGATE;
-        assert_eq!(eff, expected);
+        // Session claims ALL; tenant only grants assertion + observability
+        let eff = r.effective_policy(SessionId(10)).unwrap();
+        assert_eq!(eff.assertion,     0xFF, "assertion should pass through");
+        assert_eq!(eff.delegation,    0x00, "delegation clipped to tenant's 0");
+        assert_eq!(eff.observability, 0xFF, "observability should pass through");
+        assert_eq!(eff.disclosure,    0x00, "disclosure clipped to tenant's 0");
     }
 
     #[test]
-    fn effective_caps_missing_session_returns_none() {
+    fn effective_policy_missing_session_returns_none() {
         let r = make_registry();
-        assert!(r.effective_caps(SessionId(999)).is_none());
+        assert!(r.effective_policy(SessionId(999)).is_none());
     }
 
     #[test]
-    fn effective_caps_missing_tenant_returns_none() {
+    fn effective_policy_missing_tenant_returns_none() {
         let mut r = DomainRegistry::new();
-        // Register session whose tenant does not exist
         r.register_session(SessionDomain {
-            id:           SessionId(5),
-            tenant_id:    TenantId(99),  // no such tenant
-            claimed_caps: CapabilityBits::ALL,
-            auth_mode:    AuthorityMode::Advisory,
-            quota:        SessionQuota::default(),
+            id:             SessionId(5),
+            tenant_id:      TenantId(99),  // no such tenant
+            claimed_policy: AuthorityPolicy::ALL,
+            auth_mode:      AuthorityMode::Advisory,
+            quota:          SessionQuota::default(),
         });
-        assert!(r.effective_caps(SessionId(5)).is_none());
+        assert!(r.effective_policy(SessionId(5)).is_none());
     }
 
     #[test]
-    fn session_allows_read_within_parent_ceiling() {
+    fn session_allows_when_bounded() {
         let r = make_registry();
-        assert!(r.session_allows(SessionId(10), CapabilityBits::READ));
+        let required = AuthorityPolicy { assertion: 0x01, ..AuthorityPolicy::NONE };
+        assert!(r.session_allows(SessionId(10), required));
     }
 
     #[test]
-    fn session_disallows_stabilize_outside_parent_ceiling() {
+    fn session_disallows_when_delegation_exceeds_ceiling() {
         let r = make_registry();
-        // Tenant does not grant STABILIZE
-        assert!(!r.session_allows(SessionId(10), CapabilityBits::STABILIZE));
+        // Tenant grants no delegation; session cannot satisfy a delegation requirement
+        let required = AuthorityPolicy { delegation: 0x01, ..AuthorityPolicy::NONE };
+        assert!(!r.session_allows(SessionId(10), required));
     }
 
     // ── ShardFabricAddr tests ─────────────────────────────────────────────────
@@ -409,18 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn single_tenant_default_has_all_caps() {
+    fn single_tenant_default_allows_full_claim() {
         let mut r = DomainRegistry::new();
         let tenant = TenantDomain::single_tenant();
         r.register_tenant(tenant);
+        // Session claims only assertion; effective = intersect(claim, ALL) = claim
+        let claimed = AuthorityPolicy { assertion: 0x01, ..AuthorityPolicy::NONE };
         r.register_session(SessionDomain {
-            id:           SessionId(1),
-            tenant_id:    TenantId(0),
-            claimed_caps: CapabilityBits::READ,
-            auth_mode:    AuthorityMode::Advisory,
-            quota:        SessionQuota::default(),
+            id:             SessionId(1),
+            tenant_id:      TenantId(0),
+            claimed_policy: claimed,
+            auth_mode:      AuthorityMode::Advisory,
+            quota:          SessionQuota::default(),
         });
-        // Effective = min(READ, ALL) = READ
-        assert_eq!(r.effective_caps(SessionId(1)), Some(CapabilityBits::READ));
+        assert_eq!(r.effective_policy(SessionId(1)), Some(claimed));
     }
 }

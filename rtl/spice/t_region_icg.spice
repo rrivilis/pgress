@@ -1,0 +1,175 @@
+* rtl/spice/t_region_icg.spice
+*
+* T_REGION_ICG — two-level hierarchical ICG for ternary frustration isolation
+*
+* Clock hierarchy:
+*   CLK (trunk, always-on)
+*     → region_icg (dlclkp_1: GATE=CE_eff)
+*       → GCLK_region
+*         → cell_icg (dlclkp_1: GATE=CE_eff)
+*           → GCLK_cell
+*             → 2 × dfrtp_1 (ternary register bits)
+*
+* Lockout logic (same as T_ZERO_ICG):
+*   is_at_zero = AND2(Q_p1, inv_q0)     detect output == Zero
+*   CE_eff     = NAND2(CE_ext, is_at_zero) → INV   CE_eff = CE_ext & ~is_at_zero
+*
+* CE_eff drives BOTH ICG GATE pins:
+*   - cell_icg: GCLK_cell = GCLK_region when CE_eff=1; 0 when CE_eff=0
+*   - region_icg: GCLK_region = CLK when CE_eff=1; 0 when CE_eff=0
+*
+* When Zero state is detected (is_at_zero=1):
+*   CE_eff=0 → both ICG GATE=0
+*   region_icg latches GATE=0 at next CLK falling edge → GCLK_region=0
+*   cell_icg CLK input = GCLK_region = 0 → cell_icg has no switching
+*   GCLK_cell = GCLK_region & cell_en_latch = 0 (regardless of latch state)
+*   DFF clock inputs = 0 → no internal switching
+*
+* Baseline (T_ZERO_ICG, one dlclkp_1 only):
+*   power_active = 8.64 µW, power_isolated = 3.47 µW, isolation = 2.49×
+*   Residual 3.47 µW = cell_icg switching on always-on CLK
+*
+* This deck:
+*   power_active  ≈ slightly higher (one extra dlclkp_1 on trunk)
+*   power_isolated: only region_icg switches on CLK; cell_icg is dark
+*   Expected residual ≈ 1× dlclkp_1 leakage/switching + cell leakage ~ 1–2 µW
+*   Expected isolation_factor >> 2.49×
+*
+* Three phases (identical timing to t_zero_icg.spice for direct comparison):
+*   Phase 1 (2–40 ns): Active — Neg/Pos toggling at 250 MHz, CE_ext=1
+*   Phase 2 (40–48 ns): Zero arrives — final clock edge latches Zero
+*   Phase 3 (48–120 ns): Frustrated — both ICGs gated, all clocks dark
+*
+* Key measurements:
+*   gclk_region_isolated: avg v(GCLK_region) in phase 3 — confirms trunk gated
+*   gclk_cell_isolated:   avg v(GCLK_cell)   in phase 3 — confirms cell ICG dark
+*   isolation_factor = power_active / power_isolated
+*   Compare to T_ZERO_ICG isolation_factor = 2.49×
+
+.title T_REGION_ICG two-level hierarchical ICG — sky130_fd_sc_hd
+
+.include "$PDK_ROOT/sky130_fd_sc_hd.spice"
+
+.param VDD=1.8
+Vvdd VDD 0 DC 'VDD'
+Vvss VSS 0 DC 0
+
+* ── DUT ──────────────────────────────────────────────────────────────────────
+* sky130_fd_sc_hd pin order:
+*   inv_1:    A VGND VNB VPB VPWR Y
+*   dlclkp_1: CLK GATE VGND VNB VPB VPWR GCLK
+*   dfrtp_1:  CLK D RESET_B VGND VNB VPB VPWR Q
+*   and2_0:   A B VGND VNB VPB VPWR X
+*   nand2_1:  A B VGND VNB VPB VPWR Y
+* VNB=VSS, VPB=VDD
+
+* RST_B = active-low reset
+Xinv_rst RST VSS VSS VDD VDD RST_B  sky130_fd_sc_hd__inv_1
+
+* ── Region ICG (Level 1 — gates the trunk clock) ────────────────────────────
+* GATE=CE_eff: passes CLK when CE_eff=1 (region active), holds low when CE_eff=0
+Xregion_icg  CLK CE_eff  VSS VSS VDD VDD GCLK_region  sky130_fd_sc_hd__dlclkp_1
+
+* ── Cell ICG (Level 2 — gates GCLK_region for the DFFs) ─────────────────────
+* GATE=CE_eff: passes GCLK_region when CE_eff=1, holds low when CE_eff=0
+* In isolation: GCLK_region=0 → cell_icg CLK=0 → no switching regardless of GATE
+Xcell_icg  GCLK_region CE_eff  VSS VSS VDD VDD GCLK_cell  sky130_fd_sc_hd__dlclkp_1
+
+* ── DFFs receive fully-gated GCLK_cell ──────────────────────────────────────
+Xdff_p0  GCLK_cell D_p0 RST_B  VSS VSS VDD VDD Q_p0  sky130_fd_sc_hd__dfrtp_1
+Xdff_p1  GCLK_cell D_p1 RST_B  VSS VSS VDD VDD Q_p1  sky130_fd_sc_hd__dfrtp_1
+
+* ── CE lockout (frustration isolation) ──────────────────────────────────────
+* is_at_zero = Q_p1 & ~Q_p0  (detect Zero state {p1=1, p0=0})
+Xinv_q0   Q_p0 VSS VSS VDD VDD inv_q0  sky130_fd_sc_hd__inv_1
+Xdetect   Q_p1 inv_q0 VSS VSS VDD VDD is_at_zero  sky130_fd_sc_hd__and2_0
+
+* CE_eff = CE_ext & ~is_at_zero
+* Feeds BOTH ICG GATE pins (region_icg and cell_icg above).
+Xlockout  CE_ext is_at_zero VSS VSS VDD VDD ce_gate_b  sky130_fd_sc_hd__nand2_1
+Xinv_ce   ce_gate_b VSS VSS VDD VDD CE_eff              sky130_fd_sc_hd__inv_1
+
+* ── Parameters ───────────────────────────────────────────────────────────────
+.param TCLK=4ns
+.param TRESET=2ns
+
+* ── Clock (250 MHz, always-on trunk) ─────────────────────────────────────────
+VCLK CLK 0 PULSE(0 'VDD' 0 10ps 10ps '(TCLK/2)-10ps' 'TCLK')
+
+* ── Reset: assert for first 2 ns ─────────────────────────────────────────────
+VRST RST 0 PWL(0 'VDD'  'TRESET' 'VDD'  'TRESET+0.01ns' 0  200ns 0)
+
+* ── CE_ext: held high throughout (lockout drives both ICG gates internally) ──
+VCE CE_ext 0 DC 'VDD'
+
+* ── Stimulus (identical to t_zero_icg.spice for direct comparison) ──────────
+* Phase 1 (2–40 ns): Neg ↔ Pos toggling at 250 MHz
+VD_p0 D_p0 0 PWL(
++  0        0
++  2ns      0
++  2.01ns   0
++  5.8ns   'VDD'
++  7.8ns    0
++  9.8ns   'VDD'
++ 11.8ns    0
++ 13.8ns   'VDD'
++ 15.8ns    0
++ 17.8ns   'VDD'
++ 19.8ns    0
++ 21.8ns   'VDD'
++ 23.8ns    0
++ 25.8ns   'VDD'
++ 27.8ns    0
++ 29.8ns   'VDD'
++ 31.8ns    0
++ 33.8ns   'VDD'
++ 35.8ns    0
++ 37.8ns   'VDD'
++ 39.8ns    0
+*  Phase 2: Zero = {p0=0, p1=1} at t=40ns
++ 40ns      0
++ 120ns     0)
+
+VD_p1 D_p1 0 PWL(
++  0       0
++ 40ns     0
++ 40.01ns 'VDD'
++ 120ns   'VDD')
+
+* ── Simulation ───────────────────────────────────────────────────────────────
+.tran 1ps 120ns
+
+* ── Measurements ─────────────────────────────────────────────────────────────
+* Phase 1: active power (baseline; compare to T_ZERO_ICG: 8.64 µW)
+.measure tran power_active AVG par('(-v(VDD)*i(Vvdd))') FROM=2ns TO=40ns
+
+* Phase 2: transition energy around Zero latch
+.measure tran power_transition AVG par('(-v(VDD)*i(Vvdd))') FROM=40ns TO=48ns
+
+* Phase 3: isolated — both ICG levels gated, only region_icg sees CLK
+.measure tran power_isolated AVG par('(-v(VDD)*i(Vvdd))') FROM=60ns TO=120ns
+
+* Phase 3: verify GCLK_region is held low (region ICG gated trunk)
+.measure tran gclk_region_isolated AVG v(GCLK_region) FROM=60ns TO=120ns
+
+* Phase 3: verify GCLK_cell is held low (cell ICG dark due to GCLK_region=0)
+.measure tran gclk_cell_isolated AVG v(GCLK_cell) FROM=60ns TO=120ns
+
+* Phase 3: verify CE_eff is near 0 (lockout active)
+.measure tran ce_eff_isolated AVG v(CE_eff) FROM=60ns TO=120ns
+
+* ── Output ───────────────────────────────────────────────────────────────────
+.print tran v(CLK) v(GCLK_region) v(GCLK_cell) v(D_p0) v(D_p1) v(Q_p0) v(Q_p1) v(is_at_zero) v(CE_eff)
+.control
+  run
+  plot v(CLK)+5 v(GCLK_region)+4 v(GCLK_cell)+3 v(D_p0)+2 v(Q_p0)+1 v(is_at_zero)
+  echo "--- T_REGION_ICG two-level hierarchical ICG ---"
+  echo "Baseline T_ZERO_ICG: power_active=8.64uW  power_isolated=3.47uW  isolation=2.49x"
+  echo "  (cell ICG only: residual = cell_icg switching on always-on CLK)"
+  echo "T_REGION_ICG:"
+  print power_active power_transition power_isolated
+  echo "--- Clock gating verification (phase 3, should be ~0V each):"
+  print gclk_region_isolated gclk_cell_isolated ce_eff_isolated
+.endc
+
+.end

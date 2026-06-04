@@ -152,6 +152,18 @@ impl TopologyPartition {
             .map(|(shard_id, _)| shard_id)
     }
 
+    /// Return any healthy (`Pos`) shard. Used when there is no locality hint
+    /// (e.g. first partition for a session, no existing shard to anchor on).
+    ///
+    /// Picks the shard with the lowest `ShardId` among all healthy shards for
+    /// deterministic tie-breaking. Returns `None` if no healthy shard exists.
+    pub fn any_healthy_shard(&self) -> Option<ShardId> {
+        self.nodes.iter()
+            .filter(|(_, node)| node.is_healthy())
+            .map(|(id, _)| *id)
+            .min_by_key(|id| id.0)
+    }
+
     pub fn len(&self)      -> usize { self.nodes.len()     }
     pub fn is_empty(&self) -> bool  { self.nodes.is_empty() }
 }

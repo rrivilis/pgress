@@ -189,7 +189,7 @@ fail-fast):
 ```
 allowed =
     tenant_ok          // tenant_id ∈ session.allowed_tenants (0 always passes)
-    && capability_ok   // PartitionAuthTable[(partition_id, opcode_class)].capability_mask satisfied
+    && policy_ok       // session.effective_policy satisfies PartitionAuthTable[(partition_id, opcode_class)].policy on all four axes
     && causal_scope_ok // causal_epoch within PartitionAuthTable[partition_id].causal_scope_bits
     && lattice_flow_ok // lattice_class compatible with PartitionAuthTable[partition_id].lattice_class
     && quota_ok        // (session_id, partition_id, opcode_class) within admission budget
@@ -233,11 +233,16 @@ checks are pure table lookups keyed on `(partition_id, opcode_class)`:
 
 ```
 PartitionAuthRow {
-    partition_id:     u64,
-    opcode_class:     u8,    // which opcode class this row covers
-    capability_mask:  u64,   // permitted operations within this partition × opcode_class
-    lattice_class:    u8,    // chain / meet-semilattice / incomparable
-    causal_scope:     u8,    // local / session / global
+    partition_id:  u64,
+    opcode_class:  u8,    // which opcode class this row covers
+    policy:        AuthorityPolicy {
+        assertion:     u64,  // min assertion bits required (NONE = permissive, ALL = maximally restrictive)
+        delegation:    u64,  // min delegation bits required
+        observability: u64,  // min observability bits required
+        disclosure:    u64,  // min disclosure bits required
+    },
+    lattice_class: u8,    // chain / meet-semilattice / incomparable
+    causal_scope:  u8,    // local / session / global
 }
 ```
 
@@ -393,48 +398,56 @@ required.
 
 | Opcode | Hex    | Name             | Payload summary |
 |--------|--------|------------------|-----------------|
-| 256    | 0x0100 | `SessionProfile` | profile_id:u32, profile_version:u16, trust_level:u8, capability_mask:u64, issuer_domain:u64, session_id:u64, generation:u64, expiry_epoch:u64, sig_len:u16, signature:bytes[sig_len] |
+| 256    | 0x0100 | `SessionProfile` | profile_id:u32, profile_version:u16, trust_level:u8, assertion_mask:u64, delegation_mask:u64, observability_mask:u64, disclosure_mask:u64, issuer_domain:u64, session_id:u64, generation:u64, expiry_epoch:u64, sig_len:u16, signature:bytes[sig_len] |
 
-**`SessionProfile` semantics.** A `SessionProfile` record establishes the capability mask
+**`SessionProfile` semantics.** A `SessionProfile` record establishes the authority policy
 and trust level for the session identified by `IsaHeader.session_id`. It is the semantic
 extension layer complementary to `IsaStreamHeader.feature_flags`.
 
 - `profile_id` namespace: `0x0001–0x00FF` core profiles, `0x0100–0xFFFE` vendor,
   `0xFFFF` ad-hoc.
 - `trust_level` discriminant: `0x01` = ADVISORY (no signature required; session manager
-  clips `capability_mask` to `min(claimed, parent.capabilities)`), `0x02` = ASSERTED
-  (signature verification against issuer trust store required), `0x03` = ATTESTED
-  (signature + per-record stream MAC required).
-- `capability_mask` declares the capabilities the session asserts. For ADVISORY, this is
-  intersected with the parent tenant's `capabilities` ceiling before use. For ASSERTED and
-  ATTESTED, the mask is accepted as-is if the signature verifies.
-- The signature (ASSERTED/ATTESTED) MUST bind over the concatenation
-  `capability_mask ‖ issuer_domain ‖ session_id ‖ generation ‖ expiry_epoch`. The
-  `session_id` binding prevents splice attacks (importing a valid profile from a different
+  clips each policy axis to `min(claimed, parent.policy)` on all four dimensions),
+  `0x02` = ASSERTED (Ed25519 signature verification against issuer trust store required),
+  `0x03` = ATTESTED (signature + per-record stream MAC required).
+- **Authority policy** is four-dimensional (`AuthorityPolicy`), decomposed along the
+  integrity axis (`assertion` — can create/mutate distinctions; `delegation` — can transfer
+  assertion rights to child sessions) and the confidentiality axis (`observability` — can
+  witness distinctions; `disclosure` — can reveal distinctions across partition/session
+  boundaries). The claimed policy is intersected with the parent tenant's policy ceiling on
+  all four axes before use.
+- The signature (ASSERTED/ATTESTED) MUST bind over the 64-byte canonical payload (all
+  little-endian): `assertion_mask(8) ‖ delegation_mask(8) ‖ observability_mask(8) ‖
+  disclosure_mask(8) ‖ issuer_domain(8) ‖ session_id(8) ‖ generation(8) ‖ expiry_epoch(8)`.
+  The `session_id` binding prevents splice attacks (importing a valid profile from a different
   session). The signature algorithm is identified by `trust_level`: ADVISORY (`0x01`) carries
   no signature; ASSERTED (`0x02`) uses Ed25519; ATTESTED (`0x03`) uses Ed25519 + stream MAC.
 - `generation` is a monotone revocation counter maintained by the issuer domain. The
   receiver MUST reject profiles with `generation < min_valid_generation` for this issuer.
+  Revocation is O(1) — no network lookup required.
 - `expiry_epoch` is a `causal_epoch`-based expiry (NOT wall-clock). A session manager MUST
   reject a profile once the session's `causal_epoch` has advanced past `expiry_epoch`.
   Using `causal_epoch` rather than wall-clock time ensures distributed correctness without
   requiring clock synchronization.
 
-**`SessionProfile` wire layout** (all little-endian; total = 49 + `sig_len` bytes):
+**`SessionProfile` wire layout** (all little-endian; total = 73 + `sig_len` bytes):
 
 ```
 offset  size  field
 ──────  ────  ─────────────────────────────────────────────────────────────
-0       4     profile_id:u32       — profile namespace (see above)
-4       2     profile_version:u16  — monotone version within the profile
-6       1     trust_level:u8       — 0x01=ADVISORY, 0x02=ASSERTED, 0x03=ATTESTED
-7       8     capability_mask:u64  — asserted capability bits
-15      8     issuer_domain:u64    — TenantId of the issuing authority
-23      8     session_id:u64       — splice protection: must match stream session_id
-31      8     generation:u64       — monotone revocation counter
-39      8     expiry_epoch:u64     — causal_epoch at expiry; u64::MAX = never
-47      2     sig_len:u16          — byte length of the signature that follows
-49      sig_len  signature         — empty for ADVISORY; Ed25519/HMAC for ASSERTED/ATTESTED
+0       4     profile_id:u32          — profile namespace (see above)
+4       2     profile_version:u16     — wire version; current = 2
+6       1     trust_level:u8          — 0x01=ADVISORY, 0x02=ASSERTED, 0x03=ATTESTED
+7       8     assertion_mask:u64      — integrity axis: can create/mutate distinctions
+15      8     delegation_mask:u64     — integrity axis: can transfer assertion rights
+23      8     observability_mask:u64  — confidentiality axis: can witness distinctions
+31      8     disclosure_mask:u64     — confidentiality axis: can reveal distinctions
+39      8     issuer_domain:u64       — TenantId of the issuing authority
+47      8     session_id:u64          — splice protection: must match stream session_id
+55      8     generation:u64          — monotone revocation counter
+63      8     expiry_epoch:u64        — causal_epoch at expiry; u64::MAX = never
+71      2     sig_len:u16             — byte length of the signature that follows
+73      sig_len  signature            — empty for ADVISORY; Ed25519 for ASSERTED/ATTESTED
 ```
 
 ---

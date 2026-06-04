@@ -24,7 +24,7 @@ use pgress_core::{
         ComputeRule, ConvergencePolicy, ExecMode, NodeKind, PortKind,
         QueuePriority, RetryPolicy, RewriteStrategy, StabilizationDomain,
     },
-    partition::{DepKind, PartitionId},
+    partition::{DepKind, PartitionId, PayloadKind, ZeroKind},
     region::{CompilePolicy, RegionBoundary, StabilityContract},
     ternary::T,
     uid::Uid,
@@ -177,13 +177,50 @@ pub fn write_payload(op: &IsaOp, buf: &mut Vec<u8>) {
                     });
                     push_str_u16(buf, &port.name);
                 }
-                DepKind::Remote(_) => {
-                    // Remote dep wire encoding is not defined in v1 — emit
-                    // dep_kind=0x01 with an empty port payload so the record is
-                    // syntactically framed, even though the decoder will reject it.
-                    push_u8(buf, 0x01);
-                    push_u8(buf, 0x00);
-                    push_str_u16(buf, "");
+                DepKind::Remote(r_dep) => {
+                    // Remote dep: dep_kind=0x01, then port_kind (from RemoteDep),
+                    // then empty port_name for framing, then all RemoteDep fields.
+                    push_u8(buf, 0x01);  // dep_kind = Remote
+                    push_u8(buf, match r_dep.port_kind {
+                        PortKind::Signal => 0x00,
+                        PortKind::Effort => 0x01,
+                        PortKind::Flow   => 0x02,
+                        PortKind::Bond   => 0x03,
+                    });
+                    push_str_u16(buf, "");  // empty port_name for framing
+                    // RemoteDep fields
+                    push_pid(buf, r_dep.source_partition);
+                    push_uid(buf, r_dep.source_uid);
+                    push_u64(buf, r_dep.source_version);
+                    match &r_dep.payload_kind {
+                        PayloadKind::Definite => push_u8(buf, 0x00),
+                        PayloadKind::TypedZero(zk) => {
+                            push_u8(buf, 0x01);
+                            push_u8(buf, match zk {
+                                ZeroKind::Conflict          => 0x00,
+                                ZeroKind::Incomplete        => 0x01,
+                                ZeroKind::Ambiguous         => 0x02,
+                                ZeroKind::Retracted         => 0x03,
+                                ZeroKind::BoundaryViolation => 0x04,
+                                ZeroKind::VersionSkew       => 0x05,
+                            });
+                        }
+                    }
+                    // Frontier: sort by partition UUID for deterministic encoding (W4).
+                    let mut entries: Vec<_> = r_dep.causal_frontier.iter()
+                        .map(|(&p, &v)| (p, v))
+                        .collect();
+                    entries.sort_unstable_by_key(|(p, _)| p.as_u128());
+                    push_u16(buf, entries.len() as u16);
+                    for (pid, clock) in &entries {
+                        push_pid(buf, *pid);
+                        push_u64(buf, *clock);
+                    }
+                    // Authority provenance
+                    push_pid(buf, r_dep.source_authority);
+                    push_u64(buf, r_dep.emitted_class.0);
+                    push_u8(buf, r_dep.capability.0 as u8);
+                    push_u64(buf, r_dep.causal_scope.scope_bits);
                 }
             }
         }
@@ -529,6 +566,58 @@ mod tests {
         };
         let decoded = roundtrip(op);
         assert!(matches!(decoded, IsaOp::EdgeConnect { dep: DepKind::Local(None), .. }));
+    }
+
+    #[test]
+    fn roundtrip_edge_connect_remote_dep() {
+        use pgress_core::{
+            partition::{
+                CapabilityBits, CausalScope, LatticeClass, PayloadKind, RemoteDep, ZeroKind,
+            },
+            time::VectorClock,
+        };
+
+        let src_partition = pid(77);
+        let authority     = pid(88);
+        let mut frontier  = VectorClock::new();
+        frontier.set(src_partition, 42);
+
+        let remote = RemoteDep {
+            source_partition: src_partition,
+            source_uid:       uid(5),
+            source_version:   9,
+            port_kind:        pgress_core::node::PortKind::Flow,
+            causal_frontier:  frontier,
+            payload_kind:     PayloadKind::TypedZero(ZeroKind::Conflict),
+            source_authority: authority,
+            emitted_class:    LatticeClass(0b0011),
+            capability:       CapabilityBits::READ | CapabilityBits::PROPAGATE,
+            causal_scope:     CausalScope::UNIVERSAL,
+        };
+
+        let op = IsaOp::EdgeConnect {
+            id:  uid(1),
+            typ: "remote-dep".into(),
+            src: uid(10),
+            tgt: uid(20),
+            dep: DepKind::Remote(remote.clone()),
+        };
+        let decoded = roundtrip(op);
+        if let IsaOp::EdgeConnect { dep: DepKind::Remote(r), .. } = decoded {
+            assert_eq!(r.source_partition, src_partition);
+            assert_eq!(r.source_uid,       uid(5));
+            assert_eq!(r.source_version,   9);
+            assert_eq!(r.port_kind,        pgress_core::node::PortKind::Flow);
+            assert_eq!(r.zero_kind(),      Some(ZeroKind::Conflict));
+            // Frontier: one entry for src_partition at clock 42
+            assert_eq!(r.causal_frontier.get(src_partition), 42);
+            assert_eq!(r.source_authority, authority);
+            assert_eq!(r.emitted_class,    LatticeClass(0b0011));
+            assert_eq!(r.capability,
+                CapabilityBits::READ | CapabilityBits::PROPAGATE);
+        } else {
+            panic!("expected Remote dep after roundtrip");
+        }
     }
 
     #[test]

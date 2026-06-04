@@ -21,7 +21,7 @@ use crate::OpcodeClass;
 
 /// Pressure counters for a single engine shard.
 /// Updated by the shard; read by the admission controller.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ShardPressure {
     /// Current propagation queue depth.
     pub queue_depth: u32,

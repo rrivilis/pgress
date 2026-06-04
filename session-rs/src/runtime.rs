@@ -49,15 +49,16 @@
 
 use rustc_hash::FxHashMap;
 use pgress_core::{partition::LatticeClass, uid};
+use pgress_core::uid::Uid;
 use crate::{
     admission::{AdmissionDecision, BackpressurePolicy, ShardPressure},
-    auth::{GateResult, PartitionAuthTable},
+    auth::{AuthorityPolicy, DataplaneGateReason, GateResult, PartitionAuthTable},
     domain::{DomainRegistry, ShardDomain},
-    session::{PathTable, SessionTable},
+    profile::TrustStore,
+    session::{ExpiryPolicy, PathTable, ReapResult, SessionReaper, SessionTable},
     telemetry::{TelemetryEvent, TelemetryPartition},
     topology::TopologyPartition,
     OpcodeClass, PathId, SessionId, ShardId, TenantId, WirePartitionId,
-    auth::DataplaneGateReason,
 };
 
 // ── ParsedHeader ──────────────────────────────────────────────────────────────
@@ -147,15 +148,19 @@ pub enum RejectionReason {
 /// - Updating `ShardPressure` counters as the engine shard processes work.
 #[derive(Default)]
 pub struct SessionRuntime {
-    pub sessions:  SessionTable,
-    pub paths:     PathTable,
-    pub domains:   DomainRegistry,
-    pub auth:      PartitionAuthTable,
-    pub admission: BackpressurePolicy,
-    pub telemetry: TelemetryPartition,
-    pub topology:  TopologyPartition,
+    pub sessions:   SessionTable,
+    pub paths:      PathTable,
+    pub domains:    DomainRegistry,
+    pub auth:       PartitionAuthTable,
+    pub admission:  BackpressurePolicy,
+    pub telemetry:  TelemetryPartition,
+    pub topology:   TopologyPartition,
+    /// Issuer trust store for Asserted/Attested profile verification.
+    /// Pre-register a `VerifyingKey` per `TenantId` before accepting remote streams
+    /// with `TrustLevel::Asserted` or `TrustLevel::Attested`.
+    pub trust_store: TrustStore,
     /// Per-shard pressure counters. Updated by the caller after engine apply.
-    pub pressure:  FxHashMap<ShardId, ShardPressure>,
+    pub pressure:   FxHashMap<ShardId, ShardPressure>,
 }
 
 impl SessionRuntime {
@@ -201,7 +206,14 @@ impl SessionRuntime {
         // emitted_class: use BOTTOM (least restrictive) because the source
         // lattice class is not carried in the header. Per-edge class checks
         // are the engine's responsibility (CompiledEdgeLabel in DepMeta).
-        match self.auth.gate(header.partition_id, opcode_class, LatticeClass::BOTTOM) {
+        //
+        // session_policy: effective policy after parent ceiling intersection.
+        // Falls back to ALL (permissive) for sessions not in DomainRegistry
+        // (e.g. local bootstrap sessions created directly in SessionTable).
+        let session_policy = self.domains
+            .effective_policy(header.session_id)
+            .unwrap_or(AuthorityPolicy::ALL);
+        match self.auth.gate(header.partition_id, opcode_class, LatticeClass::BOTTOM, session_policy) {
             GateResult::Deny(reason) => {
                 self.telemetry.emit(TelemetryEvent::AuthViolation {
                     node:   uid::NIL,
@@ -245,6 +257,11 @@ impl SessionRuntime {
             _ => {}
         }
 
+        // ── 7. Record activity for expiry tracking ────────────────────────────
+        // An admitted record resets the Zero-frustration counter and advances
+        // the last-active epoch for session-expiry purposes (triggers 1 & 3).
+        self.sessions.record_activity(header.session_id, header.causal_epoch);
+
         RouteOutcome::Admitted { opcode_class }
     }
 
@@ -253,7 +270,7 @@ impl SessionRuntime {
     /// Dual-writes to the topology partition and emits a `TopologyHealthChanged`
     /// telemetry event when the ternary health value transitions.
     pub fn update_pressure(&mut self, shard_id: ShardId, pressure: ShardPressure) {
-        self.pressure.insert(shard_id, pressure.clone());
+        self.pressure.insert(shard_id, pressure);
         let (old_health, new_health) = self.topology.update(shard_id, &pressure);
         if old_health != new_health {
             self.telemetry.emit(TelemetryEvent::TopologyHealthChanged {
@@ -283,8 +300,63 @@ impl SessionRuntime {
     /// Called by the engine dispatcher after `engine.apply()` returns an empty
     /// propagation queue (i.e., no outstanding WorkCursors for this partition).
     /// Maps to `TelemetryEvent::DomainQuiescent`.
+    ///
+    /// Also increments the `consecutive_quiescent_epochs` counter for the
+    /// session that owns this partition — powering the Zero-frustration
+    /// session-expiry trigger (trigger 3 in `ExpiryPolicy`).
     pub fn notify_domain_quiescent(&mut self, partition_id: WirePartitionId) {
         self.telemetry.emit(TelemetryEvent::DomainQuiescent { partition_id });
+        // Propagate to the session's Zero-frustration counter.
+        if let Some(p) = self.domains.partitions.get(&partition_id) {
+            let sid = p.session_id;
+            self.sessions.increment_quiescent_epochs(sid);
+        }
+    }
+
+    /// Notify the telemetry partition that a cell entered or exited the Zero state.
+    ///
+    /// Called by the engine dispatcher when a node's value transitions to/from Zero.
+    /// Corresponds to the cell-level ICG: `is_at_zero = Q_p1 & ~Q_p0`.
+    pub fn notify_cell_quiescent(
+        &mut self,
+        cell_id:      Uid,
+        partition_id: WirePartitionId,
+        quiescent:    bool,
+    ) {
+        self.telemetry.emit(TelemetryEvent::CellQuiescent { cell_id, partition_id, quiescent });
+    }
+
+    /// Notify the telemetry partition that a region entered or exited quiescence.
+    ///
+    /// Called by the engine dispatcher when all cells in a region reach their
+    /// fixed points (the region-level ICG fires: `gclk` goes dark).
+    /// `quiescent_epochs` is the number of consecutive epochs spent quiescent,
+    /// analogous to `gated_trunk_cycles` in `ternary_region.sv`.
+    pub fn notify_region_quiescent(
+        &mut self,
+        region_root:      Uid,
+        partition_id:     WirePartitionId,
+        quiescent:        bool,
+        quiescent_epochs: u32,
+    ) {
+        self.telemetry.emit(TelemetryEvent::RegionQuiescent {
+            region_root,
+            partition_id,
+            quiescent,
+            quiescent_epochs,
+        });
+    }
+
+    /// Run the session reaper with the given policy and current causal epoch.
+    ///
+    /// Tombstones sessions that violate any enabled expiry trigger and returns
+    /// a `ReapResult` listing every session that was terminated.
+    ///
+    /// The caller is responsible for cleaning up `PathTable` and `DomainRegistry`
+    /// entries for tombstoned sessions after this call.
+    pub fn run_reaper(&mut self, policy: &ExpiryPolicy, current_epoch: u64) -> ReapResult {
+        let reaper = SessionReaper::new(policy.clone());
+        reaper.reap(&mut self.sessions, current_epoch)
     }
 
     /// Notify the telemetry partition that an engine step budget was exhausted.
@@ -309,7 +381,7 @@ mod tests {
     use super::*;
     use pgress_core::partition::AuthorityMode;
     use crate::{
-        auth::{AuthTableKey, PartitionAuthRow},
+        auth::{AuthorityPolicy, AuthTableKey, PartitionAuthRow},
         domain::{PartitionDomain, TenantDomain, TenantQuota},
         session::{PathEntry, PathState, SessionEntry},
     };
@@ -319,19 +391,21 @@ mod tests {
 
         // Register tenant
         rt.domains.register_tenant(TenantDomain {
-            id:           TenantId(1),
-            capabilities: pgress_core::partition::CapabilityBits::ALL,
-            quota:        TenantQuota::default(),
+            id:     TenantId(1),
+            policy: AuthorityPolicy::ALL,
+            quota:  TenantQuota::default(),
         });
 
         // Register session
         rt.sessions.create(SessionEntry {
-            session_id:       SessionId(10),
-            tenant_id:        TenantId(1),
-            active_path_id:   Some(PathId(100)),
-            prev_path_id:     None,
-            stream_seq_floor: 0,
-            auth_mode:        AuthorityMode::Advisory,
+            session_id:                   SessionId(10),
+            tenant_id:                    TenantId(1),
+            active_path_id:               Some(PathId(100)),
+            prev_path_id:                 None,
+            stream_seq_floor:             0,
+            auth_mode:                    AuthorityMode::Advisory,
+            last_active_causal_epoch:     0,
+            consecutive_quiescent_epochs: 0,
         });
 
         // Register path
@@ -419,12 +493,12 @@ mod tests {
         // a non-BOTTOM emitter IS denied.
         let (mut rt, header) = setup();
 
-        // Install a row requiring class 0b0001.
+        // Install a row requiring class 0b0001 (permissive policy — testing lattice only).
         rt.auth.install(
             AuthTableKey { partition_id: WirePartitionId(99), opcode_class: OpcodeClass::SetValue },
             PartitionAuthRow {
-                lattice_class:   pgress_core::partition::LatticeClass(0b0001),
-                capability_mask: pgress_core::partition::CapabilityBits::ALL,
+                lattice_class: pgress_core::partition::LatticeClass(0b0001),
+                policy:        AuthorityPolicy::NONE,  // no policy requirement; lattice-only test
             },
         );
 
@@ -441,6 +515,7 @@ mod tests {
                 WirePartitionId(99),
                 OpcodeClass::SetValue,
                 pgress_core::partition::LatticeClass(0b0010), // 0b0010 does NOT flow_to 0b0001
+                AuthorityPolicy::ALL,
             ),
             GateResult::Deny(DataplaneGateReason::LatticeViolation),
             "class 0b0010 must not flow_to 0b0001"
@@ -458,8 +533,8 @@ mod tests {
             PartitionAuthRow {
                 // Require TOP: only TOP flows to TOP — but BOTTOM still flows to TOP.
                 // BOTTOM (0) flows_to TOP (MAX): (0 & MAX) == 0 → true.
-                lattice_class:   pgress_core::partition::LatticeClass::TOP,
-                capability_mask: pgress_core::partition::CapabilityBits::ALL,
+                lattice_class: pgress_core::partition::LatticeClass::TOP,
+                policy:        AuthorityPolicy::NONE,
             },
         );
         assert!(rt.route_record(&header).is_admitted());
@@ -518,9 +593,7 @@ mod tests {
 
     #[test]
     fn auth_denial_emits_auth_violation() {
-        use crate::auth::{AuthTableKey, PartitionAuthRow};
-        use pgress_core::partition::{CapabilityBits, LatticeClass};
-        let (mut rt, mut header) = setup();
+        let (rt, header) = setup();
 
         // Force an auth denial by installing a row with a capability mask
         // that the BOTTOM emitter won't satisfy -- this requires testing

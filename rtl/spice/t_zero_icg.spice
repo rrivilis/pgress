@@ -1,0 +1,169 @@
+* rtl/spice/t_zero_icg.spice
+*
+* T_ZERO_ICG — frustration isolation cell with ICG clock gate
+*
+* Variant of T_ZERO that replaces the CE MUX pair with a dlclkp_1 ICG macro.
+* The MUX-based design keeps the clock running to the DFF even when CE=0;
+* the clock network switches every cycle regardless. dlclkp_1 gates the clock
+* at the source so GCLK is held low during the isolated phase — DFF clock
+* input never toggles → zero dynamic power in clock network and DFF internals.
+*
+* Baseline (T_ZERO standard cell composition):
+*   9 cells: inv_1 + 2×mux2_1 + 2×dfrtp_1 + inv_1 + and2_0 + nand2_1 + inv_1
+*   isolation_factor ~ 1.05× (clock network dominates; CE MUX not helpful)
+*   power_isolated ~ leakage only from DFF + combinational, but CLK still active
+*
+* ICG variant:
+*   8 cells: inv_1 + dlclkp_1 + 2×dfrtp_1 + inv_1 + and2_0 + nand2_1 + inv_1
+*   Removes: 2×mux2_1 (CE function moved to clock gate)
+*   Adds:    1×dlclkp_1
+*   Net cell reduction: 9→8 cells
+*
+* dlclkp_1 pin order: CLK GATE VGND VNB VPB VPWR GCLK
+*   GATE=1 → GCLK follows CLK (active)
+*   GATE=0 → GCLK held low (clock gated, DFF input frozen)
+*
+* CE_eff = CE_ext & ~is_at_zero (same lockout logic as T_ZERO)
+* GATE input to dlclkp_1 = CE_eff
+* DFFs use GCLK instead of CLK — no MUX needed on D input
+*
+* Phase 1 (2–40 ns): Active — CE_eff=1 → GCLK = CLK → DFFs toggle at 250 MHz
+*   power_active: baseline; should be similar to T_ZERO power_active (~12–15 µW)
+*   but slightly lower (no MUX switching on D path)
+*
+* Phase 2 (40–48 ns): Zero arrives — last clock edge latches Zero
+*   is_at_zero asserts → CE_eff=0 → GATE=0 → GCLK frozen low
+*   power_transition: energy of the final latch + ICG settle
+*
+* Phase 3 (48–120 ns): Frustrated/isolated
+*   GCLK=0 permanently: DFF clock input never toggles
+*   DFF internal nodes fully quiescent
+*   Only residual: leakage + combinational lockout logic (static)
+*   power_isolated: expected << T_ZERO power_isolated
+*   Expected isolation_factor: 10–50× (vs 1.05× for MUX-based T_ZERO)
+*
+* Comparison metric:
+*   area:    8 cells vs 9 (11% reduction)
+*   power_active:   ~similar (clock tree dominates in both)
+*   power_isolated: ICG >> 10× better than MUX variant
+*   isolation_factor: ICG isolation_factor / T_ZERO isolation_factor = structural proof
+
+.title T_ZERO_ICG frustration isolation with ICG — sky130_fd_sc_hd
+
+.include "$PDK_ROOT/sky130_fd_sc_hd.spice"
+
+.param VDD=1.8
+Vvdd VDD 0 DC 'VDD'
+Vvss VSS 0 DC 0
+
+* ── DUT ──────────────────────────────────────────────────────────────────────
+* sky130_fd_sc_hd pin order:
+*   inv_1:    A VGND VNB VPB VPWR Y
+*   dlclkp_1: CLK GATE VGND VNB VPB VPWR GCLK
+*   dfrtp_1:  CLK D RESET_B VGND VNB VPB VPWR Q
+*   and2_0:   A B VGND VNB VPB VPWR X
+*   nand2_1:  A B VGND VNB VPB VPWR Y
+* VNB=VSS, VPB=VDD
+
+* RST_B = active-low reset
+Xinv_rst RST VSS VSS VDD VDD RST_B  sky130_fd_sc_hd__inv_1
+
+* ICG: GATE=CE_eff; GCLK = CLK when CE_eff=1, 0 when CE_eff=0
+Xicg  CLK CE_eff  VSS VSS VDD VDD GCLK  sky130_fd_sc_hd__dlclkp_1
+
+* DFFs receive GCLK (no mux on D path — D is always the incoming data)
+Xdff_p0  GCLK D_p0 RST_B  VSS VSS VDD VDD Q_p0  sky130_fd_sc_hd__dfrtp_1
+Xdff_p1  GCLK D_p1 RST_B  VSS VSS VDD VDD Q_p1  sky130_fd_sc_hd__dfrtp_1
+
+* ── CE lockout (frustration isolation) ──────────────────────────────────────
+* Detect Zero state: is_at_zero = Q_p1 & ~Q_p0
+Xinv_q0  Q_p0 VSS VSS VDD VDD inv_q0  sky130_fd_sc_hd__inv_1
+Xdetect  Q_p1 inv_q0 VSS VSS VDD VDD is_at_zero  sky130_fd_sc_hd__and2_0
+
+* CE_eff = CE_ext & ~is_at_zero  (feeds ICG GATE, not DFF CE pin)
+Xlockout  CE_ext is_at_zero VSS VSS VDD VDD ce_gate_b  sky130_fd_sc_hd__nand2_1
+Xinv_ce   ce_gate_b VSS VSS VDD VDD CE_eff              sky130_fd_sc_hd__inv_1
+
+* ── Parameters ───────────────────────────────────────────────────────────────
+.param TCLK=4ns
+.param TRESET=2ns
+
+* ── Clock (250 MHz) ──────────────────────────────────────────────────────────
+VCLK CLK 0 PULSE(0 'VDD' 0 10ps 10ps '(TCLK/2)-10ps' 'TCLK')
+
+* ── Reset: assert for first 2 ns ─────────────────────────────────────────────
+VRST RST 0 PWL(0 'VDD'  'TRESET' 'VDD'  'TRESET+0.01ns' 0  200ns 0)
+
+* ── CE_ext: held high throughout (lockout is internal via ICG GATE) ──────────
+VCE CE_ext 0 DC 'VDD'
+
+* ── Stimulus (identical to t_zero.spice for direct comparison) ──────────────
+* Phase 1 (2–40 ns): Neg ↔ Pos toggling at 250 MHz (p1=0, p0 alternates)
+VD_p0 D_p0 0 PWL(
++  0        0
++  2ns      0
++  2.01ns   0
++  5.8ns   'VDD'
++  7.8ns    0
++  9.8ns   'VDD'
++ 11.8ns    0
++ 13.8ns   'VDD'
++ 15.8ns    0
++ 17.8ns   'VDD'
++ 19.8ns    0
++ 21.8ns   'VDD'
++ 23.8ns    0
++ 25.8ns   'VDD'
++ 27.8ns    0
++ 29.8ns   'VDD'
++ 31.8ns    0
++ 33.8ns   'VDD'
++ 35.8ns    0
++ 37.8ns   'VDD'
++ 39.8ns    0
+*  Phase 2: Zero = {p0=0, p1=1} arrives at t=40ns
++ 40ns      0
++ 120ns     0)
+
+VD_p1 D_p1 0 PWL(
++  0       0
++ 40ns     0
++ 40.01ns 'VDD'
++ 120ns   'VDD')
+
+* ── Simulation ───────────────────────────────────────────────────────────────
+.tran 1ps 120ns
+
+* ── Measurements ─────────────────────────────────────────────────────────────
+* Phase 1: active power (same window as t_zero.spice for direct comparison)
+.measure tran power_active AVG par('(-v(VDD)*i(Vvdd))') FROM=2ns TO=40ns
+
+* Phase 2: transition energy around Zero latch
+.measure tran power_transition AVG par('(-v(VDD)*i(Vvdd))') FROM=40ns TO=48ns
+
+* Phase 3: isolated / frustrated — clock fully gated, DFF quiescent
+.measure tran power_isolated AVG par('(-v(VDD)*i(Vvdd))') FROM=60ns TO=120ns
+
+* Verify GCLK is held low during isolation (ICG gate engaged)
+.measure tran gclk_during_isolation AVG v(GCLK) FROM=60ns TO=120ns
+
+* Verify CE_eff is 0 during isolation
+.measure tran ce_eff_during_isolation AVG v(CE_eff) FROM=60ns TO=120ns
+
+* ── Output ───────────────────────────────────────────────────────────────────
+.print tran v(CLK) v(GCLK) v(D_p0) v(D_p1) v(Q_p0) v(Q_p1) v(is_at_zero) v(CE_eff)
+.control
+  run
+  plot v(CLK)+5 v(GCLK)+4 v(D_p0)+3 v(D_p1)+2 v(Q_p0)+1 v(is_at_zero) v(CE_eff)
+  echo "--- T_ZERO_ICG power characterization ---"
+  echo "Baseline T_ZERO: power_active~12uW  power_isolated~11uW  isolation_factor~1.05x"
+  print power_active power_transition power_isolated
+  let isolation_factor = power_active / power_isolated
+  print isolation_factor
+  echo "--- GCLK avg during isolation (should be ~0 — clock fully gated):"
+  print gclk_during_isolation
+  echo "--- CE_eff avg during isolation (should be ~0):"
+  print ce_eff_during_isolation
+.endc
+
+.end

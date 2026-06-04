@@ -40,6 +40,13 @@ pub mod runtime;
 pub mod dispatch;
 pub mod encode;
 
+/// Deterministic in-process simulation harness.
+///
+/// Enabled via `#[cfg(any(test, feature = "sim"))]`. Not compiled into
+/// release builds unless the `sim` feature is explicitly enabled.
+#[cfg(any(test, feature = "sim"))]
+pub mod sim;
+
 // ── Wire-format ID newtypes (u64 from IsaHeader / IsaStreamHeader) ────────────
 //
 // These are deliberately distinct from pgress_core::partition::PartitionId (uuid::Uuid).
@@ -79,7 +86,10 @@ pub use domain::{
     TenantDomain, SessionDomain, PartitionDomain, ShardDomain,
     DomainRegistry, TenantQuota, SessionQuota,
 };
-pub use session::{SessionEntry, PathEntry, PathState, SessionTable, PathTable, SessionError};
+pub use session::{
+    SessionEntry, PathEntry, PathState, SessionTable, PathTable, SessionError,
+    ExpiryPolicy, ExpiryReason, SessionReaper, ReapResult,
+};
 pub use auth::{PartitionAuthRow, PartitionAuthTable, AuthTableKey, GateResult, DataplaneGateReason};
 pub use profile::{SessionProfile, TrustLevel, ProfileId, ProfileError};
 pub use admission::{AdmissionDecision, BackpressurePolicy, ShardPressure};

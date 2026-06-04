@@ -27,3 +27,6 @@ Thumbs.db
 *.swp
 *.swo
 
+# RTL
+rtl/sim/build/
+rtl/spice/*.out

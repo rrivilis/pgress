@@ -99,11 +99,11 @@ if val == old { return Ok(vec![]); }  // single u8 comparison; no clock tick, no
 
 **500-input convergence (1.0× amplification)**
 
-A graph with 500 inputs feeding a single `MeetAll` output fires the output exactly once — after the 500th input arrives and state transitions Pending → Ready. Intermediate pushes are held in Pending state with zero downstream materializations.
+A graph with 500 inputs feeding a single `MeetAll` output fires the output exactly once, after the 500th input arrives and state transitions Pending → Ready. Intermediate pushes are held in Pending state with zero downstream materializations.
 
-**Bochvar infection and recovery (O(1))**
+**Infectious state and recovery (O(1))**
 
-When any dependency is `Zero`, the output is forced to `Zero` regardless of the other 499. Recovery is O(1) — only the toggling dep changes. The output fires on every toggle because `Zero → Pos` is a value change.
+When any dependency is `Zero`, the output is forced to `Zero` regardless of the other 499. Recovery is O(1); only the toggling dep changes. The output fires on every toggle because `Zero → Pos` is a value change.
 
 **Lazy coalescing**
 
@@ -138,7 +138,7 @@ The closest competitor is **Salsa** (rust-analyzer): also incremental, also DAG-
 
 - Small graphs under light load. The ISA dispatch, partition registry, and authority model carry constant-factor overhead. A 5-node graph with one writer will be faster in a HashMap. The amplification advantage emerges at scale in dense fan-in, high update rates, mixed eager/lazy topologies.
 
-- Concurrent access. `Graph` is not thread-safe as of now. pgress currently assumes serialized graph mutation. Multi-writer concurrency, lock-free reads, and distributed graph ownership are not part of the execution model currently.
+- Concurrent access. Each engine shard assumes serialized mutation; `Graph` has no internal locking. Multi-shard parallelism (via EnginePool + pick_shard_for) is the concurrency model: shards run independently, each serialized within. Lock-free reads and multi-writer access within a single shard are not supported.
 
 ---
 
@@ -176,147 +176,37 @@ Build: `maturin develop --release` inside `pgress/py/` with an active virtualenv
 
 ---
 
-## Implementation: `core-rs`
+## Implementation
 
-The active implementation is `pgress/core-rs`, a Rust crate. It implements the full computation substrate: ISA dispatch, ternary propagation, dependency tracking, delta-gated subscription, e-graph equivalence saturation, and an authority discipline over partition boundaries.
+`core-rs` is the computation substrate: 18-opcode ISA, ternary propagation, delta-gated dependency tracking, e-graph equivalence saturation, two-layer node decomposition (identity / interpretation), and a partition authority model with `LatticeClass` + `CapabilityBits` bitmask gates. `session-rs` is the session manager dataplane that sits above the engine: wire decoding, path-to-session routing, four-dimensional `AuthorityPolicy` enforcement, admission control, shard placement, session expiry, and telemetry. The two crates share no mutable state; `session-rs` never imports engine internals.
 
-### ISA — the instruction set
-
-All graph mutation goes through 18 ISA operations:
-
-**Extension** — grow the graph / set values:
-
-| Operation | Effect |
-|---|---|
-| `NodeCreate` | Add a node (Input or Computed with a rule) |
-| `EdgeConnect` | Add a typed dependency edge; registers subscription; infers `ExecMode` from port kind |
-| `Subscribe` | Register a push subscription directly |
-| `SetValue` | Set an input node's value; delta-gates downstream push |
-| `Propagate` | Eagerly push a node's current value to its subscribers |
-
-**Inhibition** — retract / demand:
-
-| Operation | Effect |
-|---|---|
-| `DelNode` | Remove a node + incident edges; DPO admissibility enforced |
-| `DelEdge` | Remove a dependency edge |
-| `Demand` | Pull-evaluate a Lazy node and its transitive pending deps |
-| `SetMode` | Set execution mode: Eager / Lazy / Stabilizing |
-
-**Reflection** — flip polarity / stabilize:
-
-| Operation | Effect |
-|---|---|
-| `Reflect` | Apply `mv_neg` to a node's value and all ternary attrs; bumps version |
-| `Stabilize` | Run e-graph saturation over a region; resolve or leave as `Zero` |
-
-**Authority / partition** — id-layer only, no propagation enqueued:
-
-| Operation | Effect |
-|---|---|
-| `PartitionCreate` | Declare a partition with its `AuthorityRoot`, `LatticeClass`, and `CausalScope` |
-| `PartitionBind` | Bind a node to a partition; triggers compiled edge-label recompilation |
-| `SetPartitionAuthority` | Mutate a partition's lattice class or causal domain |
-| `SetEdgeLabel` | Compile and store an `EdgeLabel` on a `(source, target)` dep |
-| `SetStabilizationConfig` | Set node-local e-graph semantics (strategy, domain, budget, convergence policy) |
-| `SetExecutionPolicy` | Set node scheduling policy (queue priority, retry behavior) |
-
-**Region compilation** — freeze topology for sparse circuit execution:
-
-| Operation | Effect |
-|---|---|
-| `RegionDeclare` | Declare a subgraph region; compiles a CSR sparse circuit artifact if `CompilePolicy::Eager` |
-
-### Two-layer decomposition (I8)
-
-Every node carries two strictly separated layers:
-
-```
-id_layer(n)     = (uid, typ, kind)            — persistent, set once at NodeCreate
-interp_layer(n) = (value, attrs, version)      — versioned, mutated by SetValue / Reflect / Stabilize
-```
-
-Every write to the interpretation layer that changes `value` or `attrs` increments `version`. A `(uid, version)` pair addresses a unique historical interpretation. Snapshots capture both layers independently via structural sharing — O(1) clone.
-
-### Delta-gated propagation
-
-Every `(source, subscriber)` dependency pair carries a `DepMeta` with:
-- `label: CompiledEdgeLabel` — compiled flat form containing `projection_mask`, `capability`, `lattice_class`, and `causal_scope_bits`
-- `last_seen: ProductTime` — the causal timestamp at which this subscriber last processed a push
-
-A push is gated by `should_propagate(meta, current_time)`:
-```rust
-for dim in meta.label.projection_mask.dims {
-    if current_time[dim] > meta.last_seen[dim] { return true; }
-}
-false
-```
-
-Setting the same value twice produces zero downstream version bumps on the second set. `CompiledEdgeLabel` is pre-baked into `DepMeta` so the hot path never touches the `PartitionRegistry`.
-
-### Partition authority
-
-`LatticeClass(u64)` encodes the transitive closure of the partition class hierarchy as a bitmask. The partial-order check is a single bit operation:
-```rust
-fn flows_to(self, other: LatticeClass) -> bool { (self.0 & other.0) == self.0 }
-```
-
-`CapabilityBits(u64)` is an unforgeable bitfield of permitted operations on a dep edge (`READ`, `PROPAGATE`, `STABILIZE`).
-
-The **`authority_gate`** hot-path check is exactly three bit operations, no allocation, no registry access:
-```rust
-fn authority_gate(compiled: &CompiledEdgeLabel, emitted: &EmittedAuth) -> Result<(), GateReason> {
-    compiled.capability.allows(emitted.capability)?;   // bit AND
-    compiled_scope.contains(emitted.scope_bits)?;      // bit AND
-    emitted.class.flows_to(compiled.lattice_class)?;   // bit AND
-    Ok(())
-}
-```
-
-Three `AuthorityMode` levels: `Advisory` (zero cost — no struct construction, no gate evaluated), `Audit` (one HashMap lookup + 3 bit ops, violations logged), `Enforced` (unauthorized subscriber enqueue suppressed).
-
----
-
-## Session manager: `session-rs`
-
-`session-rs` is the dataplane layer above the engine. It sits between the wire and the engine shard, applying admission checks from the `IsaHeader` alone — without parsing record bodies — and routing admitted records to the correct engine shard.
-
-```
-wire record
-  ↓ IsaStreamHeader   path_id → session_id (PathTable)
-  ↓ IsaHeader         session lookup, tenant check, stream_seq replay gate
-  ↓ opcode classify   OpcodeClass from opcode u16 alone
-  ↓ partition auth    PartitionAuthTable[(partition_id, opcode_class)] lattice gate
-  ↓ admission         BackpressurePolicy — per opcode class treatment under load
-  → engine shard      RouteOutcome::Admitted { opcode_class }
-```
-
-### Domain hierarchy
-
-Authority is structurally bounded downward through four levels. A child domain can never hold capabilities its parent does not hold:
-
-```
-tenant      capability ceiling + aggregate quota
-  └─ session    stream continuity + auth mode  (stable across path migration)
-       └─ partition   causal isolation + PartitionAuthTable scope
-            └─ shard      engine instance + quiescence guarantee + WorkCursor budget
-```
-
-### Session / path split (QUIC-style)
-
-`session_id` is stable logical identity — survives transport interruptions and path migrations. `path_id` is ephemeral transport identity — lives in `IsaStreamHeader` only; the engine never sees it. `stream_seq` is session-scoped: increments continuously across path migrations, resets only on session termination.
-
-### Execution geometry: topology as a partition
-
-The topology partition (`PARTITION_TOPOLOGY = 0xFFFF_FFFF_FFFF_FFFD`) materialises the network diameter as a pgress graph using existing primitives — no separate routing protocol, no separate topology manager.
-
-`ShardPressure` events are dual-written as ternary health state on shard nodes: `Pos` = accept new work, `Zero` = congested (prefer others), `Neg` = hot or unknown (do not route here). Placement decisions are resolved by reading the converged ternary — the propagation through the topology graph has already computed the routing. No BFS, no routing table update protocol, no separate placement service.
+For design details such as the ISA reference, two-layer decomposition, delta-gate mechanics, quiescent state model, RTL clock-gating coupling, session manager architecture, trust boundary, and distributed consistency model, see [`spec/architecture.md`](spec/architecture.md).
 
 ---
 
 ## Test suite
 
-**Current results: 107/107 passing** (`pgress-core`, 73 unit + 20 proptest + 14 amplification assertion tests) **+ 151/151 passing** (`pgress-session`). **49/49 Python tests passing.**
+**Current results: 107/107 passing** (`pgress-core`, 73 unit + 20 proptest + 14 amplification assertion tests) **+ 198/198 passing** (`pgress-session`). **49/49 Python tests passing.**
+
+### Deterministic simulation results (11/11 passing)
+
+The `sim` feature gate enables a TigerBeetle-style in-process cluster simulation: seeded `Lcg64` deterministic RNG, explicit tick driver, and a simulated message bus with configurable drop rate, delay, and bidirectional partition injection. Key results:
+
+| Test | Property verified |
+|---|---|
+| `no_false_pos_after_shard_crash` | **Safety**: a crashed shard's topology node never reads `Pos` on surviving shards |
+| `crash_emits_topology_health_changed_event` | Crash event appears on telemetry partition |
+| `healing_converges_to_pos` | **Liveness**: after heal, all peers converge to `Pos` within `max_delay + 5` ticks |
+| `heal_emits_pos_topology_event_on_all_shards` | Heal event appears on all shard telemetry streams |
+| `placement_skips_crashed_shard` | Placement routing avoids `Neg` shards |
+| `placement_prefers_lowest_id_on_tie` | Tie-breaking is deterministic |
+| `network_partition_isolates_gossip` | Partitioned shards do not receive cross-partition gossip |
+| `deterministic_replay_same_seed_same_health_sequence` | Full replay determinism from seed |
+| `convergence_under_different_gossip_orderings` | **AP structural test**: `delay=0` and `delay=3` orderings converge to the same final health class — the non-canonical paths collapse to the same observable quotient |
+| `reaper_fires_only_on_stale_sessions` | Session expiry fires on inactive sessions, not active ones |
+| `congested_shard_shows_zero_not_neg` | Congestion maps to `Zero` (contested/prefer-others), not `Neg` (absent) |
+
+The AP structural test (`convergence_under_different_gossip_orderings`) is the key distributed systems result: it directly validates that different delivery orderings of the same events — corresponding to different non-canonical rewrite paths through the e-graph — produce the same converged observable health class. Non-confluence at the rewrite level; convergence at the quotient level.
 
 ### Property-based invariants (proptest) — 256 random ISA op sequences each
 
@@ -359,6 +249,7 @@ The canonical wire encoding is specified in `spec/abi.md`. Key properties:
 
 | Document | Contents |
 |---|---|
+| `spec/architecture.md` | ISA reference; quiescent state model; RTL clock-gating; session manager; trust boundary; distributed consistency model |
 | `spec/abi.md` | Binary wire encoding v0x0003; IsaHeader; IsaStreamHeader; opcode table; SessionProfile; evolution policy |
 | `spec/integration.md` | Integration reference for host application or network service |
 | `spec/benchmarks.md` | Work amplification results; hot-path optimization notes |
@@ -373,6 +264,7 @@ pgress/
 ├── README.md            — this file
 ├── Cargo.toml           — workspace root (core-rs, session-rs, py)
 ├── spec/
+│   ├── architecture.md  — ISA; quiescence/RTL; session manager; trust boundary; consistency model
 │   ├── abi.md           — binary wire encoding (v0x0003)
 │   ├── integration.md   — reference for session-rs integrations
 │   ├── benchmarks.md    — amplification results, hot-path optimization notes
@@ -388,13 +280,18 @@ pgress/
 │       ├── opcode.rs    — OpcodeClass; classify from opcode u16
 │       ├── domain.rs    — tenant/session/partition/shard hierarchy; capability inheritance
 │       ├── session.rs   — SessionTable, PathTable; stream_seq / path migration
-│       ├── auth.rs      — PartitionAuthTable; lattice gate
-│       ├── profile.rs   — SessionProfile; TrustLevel; Advisory/Asserted/Attested
+│       ├── auth.rs      — AuthorityPolicy (assertion/delegation/observability/disclosure); PartitionAuthTable; lattice + policy gate
+│       ├── profile.rs   — SessionProfile wire format; TrustStore; Advisory/Asserted/Attested; Ed25519 verification
 │       ├── admission.rs — BackpressurePolicy; ShardPressure; AdmissionDecision
 │       ├── recovery.rs  — WorkCursor; EngineOutcome; FailureAction
 │       ├── telemetry.rs — TelemetryPartition; TelemetryEvent; health transitions
 │       ├── topology.rs  — TopologyPartition; placement; ShardFabricAddr locality
-│       └── runtime.rs   — SessionRuntime; ParsedHeader; route_record pipeline
+│       ├── runtime.rs   — SessionRuntime; ParsedHeader; route_record pipeline
+│       └── sim/         — deterministic simulation harness (feature = "sim")
+│           ├── mod.rs   — SimCluster; Lcg64 RNG; tick driver; 11 sim tests
+│           ├── network.rs — SimNetwork; PendingMsg; drain_due
+│           ├── faults.rs — FaultPolicy; drop_rate, delay, bidirectional partitions
+│           └── workload.rs — WorkloadBuilder; CrossShardWorkload (bench helpers)
 ├── py/                  — Python SDK — PyO3/maturin binding
 │   ├── Cargo.toml       — cdylib crate depending on core-rs + pyo3
 │   ├── pyproject.toml   — maturin build config; abi3-py39 wheel
@@ -402,6 +299,32 @@ pgress/
 │   ├── pygress/__init__.py
 │   ├── python.md        — SDK reference (this is what you want to read)
 │   └── tests/test_pygress.py
+├── rtl/                 — Hardware implementation
+│   ├── sv/              — SystemVerilog RTL
+│   │   ├── ternary_cell.sv      — single ternary cell; {p1,p0} two-bit encoding
+│   │   ├── ternary_cell_syn.sv  — synthesis-ready variant
+│   │   ├── ternary_chain.sv     — chain topology
+│   │   ├── ternary_tree.sv      — tree topology
+│   │   ├── ternary_region.sv    — region-level ICG; quiescence hierarchy
+│   │   ├── meetall_500.sv       — 500-input MeetAll benchmark module
+│   │   ├── icg_model.sv         — ICG behavioral model
+│   │   ├── tb_meetall.sv        — MeetAll testbench
+│   │   └── tb_topology.sv       — topology testbench
+│   ├── hls/             — HLS kernel (Vitis HLS)
+│   │   ├── ternary_meetall.h/cpp — MeetAll kernel
+│   │   ├── tb_meetall.cpp       — HLS testbench
+│   │   └── directives.tcl       — synthesis directives
+│   ├── syn/             — Synthesis (Yosys)
+│   │   ├── synth_ternary_cell.ys
+│   │   └── run_synth.sh
+│   ├── spice/           — SPICE netlists and simulation outputs
+│   │   ├── t_cell.spice / t_dff.spice / t_zero.spice / t_zero_icg.spice
+│   │   ├── t_region_icg.spice
+│   │   └── run_spice.sh
+│   └── sim/             — Verilator simulation
+│       ├── run_verilator.sh
+│       ├── run_topology.sh
+│       └── build/               — generated Verilator output (not checked in)
 ├── demo/                — React + FastAPI interactive demo
 │   ├── backend/         — Python FastAPI server; 6 scenarios
 │   └── frontend/        — React Flow canvas; ternary state visualization

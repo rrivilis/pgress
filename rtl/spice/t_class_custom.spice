@@ -1,0 +1,142 @@
+* rtl/spice/t_class_custom.spice
+*
+* T_CLASS_CUSTOM — transistor-level ternary slot classifier
+*
+* Baseline: t_class.spice (standard cell composition)
+*   nor2_1 + 2×inv_1 + 2×and2_0 = 5 cells, ~20 transistors
+*   tpd_neg=22.7 ps, tpd_pos=36.1 ps, tpd_zero=60.7 ps, power=1.95 µW
+*
+* Custom implementation: single flat MOSFET netlist
+*   Same 20 transistors, but:
+*   (a) shared ~p0/~p1 internal nodes drive NAND2 inputs directly —
+*       no re-buffered inverter output stage, no inter-cell routing parasitics
+*   (b) minimum transistor sizing (no FO4 overdrive on internal nodes)
+*   (c) NOR2 PUN uses 2× wider PMOS to preserve rise/fall balance
+*   (d) NAND2 PDN uses 2× wider NMOS for series stack drive
+*
+* Expected improvement over standard cell composition:
+*   tpd_pos / tpd_zero: ~20-30% faster (remove inter-cell boundary load)
+*   tpd_neg: ~similar (NOR2 is already optimal in standard cell)
+*   power: ~20-30% lower (minimum sizing, no excess drive strength)
+*
+* Transistor sizing (sky130_fd_sc_hd HD family convention, scale=1.0u):
+*   nfet nominal:        W=650000u  L=150000u
+*   pfet nominal:        W=420000u  L=150000u
+*   nfet 2× (stack):    W=1300000u L=150000u
+*   pfet 2× (NOR PUN):  W=840000u  L=150000u
+*
+* All transistors: sky130_fd_pr__nfet_01v8 / sky130_fd_pr__pfet_01v8_hvt
+* Ports for both: (drain gate source body)
+*   nfet body = VSS (p-substrate)
+*   pfet body = VDD (n-well)
+
+.title T_CLASS_CUSTOM — flat MOSFET ternary classifier — sky130
+
+.include "$PDK_ROOT/sky130_fd_sc_hd.spice"
+
+.param VDD=1.8
+Vvdd VDD 0 DC 'VDD'
+Vvss VSS 0 DC 0
+
+* ── Custom T_CLASS subcircuit ────────────────────────────────────────────────
+.subckt custom_t_class p0 p1 is_neg is_zero is_pos VDD VSS
+
+* Shared inversions (~p0, ~p1): drive NAND2 inputs for is_pos and is_zero
+* Sized at HD minimum (FO2 adequate for 2 NAND2 gate loads)
+Xinv_p0_p p0_b p0 VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+Xinv_p0_n p0_b p0 VSS VSS sky130_fd_pr__nfet_01v8     w=650000u l=150000u
+
+Xinv_p1_p p1_b p1 VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+Xinv_p1_n p1_b p1 VSS VSS sky130_fd_pr__nfet_01v8     w=650000u l=150000u
+
+* is_neg = NOR(p0, p1)
+* PUN: series PMOS (2× width for series stack drive strength parity)
+Xneg_pp0 neg_mid p0 VDD  VDD sky130_fd_pr__pfet_01v8_hvt w=840000u l=150000u
+Xneg_pp1 is_neg  p1 neg_mid VDD sky130_fd_pr__pfet_01v8_hvt w=840000u l=150000u
+* PDN: parallel NMOS
+Xneg_np0 is_neg  p0 VSS  VSS sky130_fd_pr__nfet_01v8 w=650000u l=150000u
+Xneg_np1 is_neg  p1 VSS  VSS sky130_fd_pr__nfet_01v8 w=650000u l=150000u
+
+* is_pos = AND(p0, ~p1) = NAND2(p0, p1_b) then INV
+* NAND2 PUN: parallel PMOS (p1_b already available from shared INV above)
+Xpos_pp0 pos_nand p0   VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+Xpos_pp1 pos_nand p1_b VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+* NAND2 PDN: series NMOS (2× width for series stack)
+Xpos_np0 pos_nand p0   pos_stk VSS sky130_fd_pr__nfet_01v8 w=1300000u l=150000u
+Xpos_np1 pos_stk  p1_b VSS     VSS sky130_fd_pr__nfet_01v8 w=1300000u l=150000u
+* INV output stage
+Xpos_ip  is_pos pos_nand VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+Xpos_in  is_pos pos_nand VSS VSS sky130_fd_pr__nfet_01v8     w=650000u l=150000u
+
+* is_zero = AND(~p0, p1) = NAND2(p0_b, p1) then INV
+* NAND2 PUN: parallel PMOS (p0_b already available from shared INV above)
+Xzero_pp0 zero_nand p0_b VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+Xzero_pp1 zero_nand p1   VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+* NAND2 PDN: series NMOS (2× width for series stack)
+Xzero_np0 zero_nand p0_b zero_stk VSS sky130_fd_pr__nfet_01v8 w=1300000u l=150000u
+Xzero_np1 zero_stk  p1   VSS      VSS sky130_fd_pr__nfet_01v8 w=1300000u l=150000u
+* INV output stage
+Xzero_ip  is_zero zero_nand VDD VDD sky130_fd_pr__pfet_01v8_hvt w=420000u l=150000u
+Xzero_in  is_zero zero_nand VSS VSS sky130_fd_pr__nfet_01v8     w=650000u l=150000u
+
+.ends custom_t_class
+
+* ── DUT ──────────────────────────────────────────────────────────────────────
+Xdut p0 p1 is_neg is_zero is_pos VDD VSS custom_t_class
+
+* ── Stimulus (identical to t_class.spice for direct comparison) ──────────────
+Vp0 p0 0 PWL(
++  0ns   0
++  5ns   0
++  5.01ns 'VDD'
++ 10ns   'VDD'
++ 10.01ns 0
++ 15ns   0
++ 20ns   0
++ 25ns   0
++ 25.01ns 'VDD'
++ 30ns   'VDD')
+
+Vp1 p1 0 PWL(
++  0ns   0
++  10ns  0
++  10.01ns 'VDD'
++ 15ns  'VDD'
++ 15.01ns 0
++ 20ns  0
++ 20.01ns 'VDD'
++ 25ns  'VDD'
++ 25.01ns 0
++ 30ns  0)
+
+* ── Simulation ───────────────────────────────────────────────────────────────
+.tran 1ps 30ns
+
+* ── Measurements ─────────────────────────────────────────────────────────────
+* tpd_pos: p0 0→1 at t=5ns → is_pos rises (INV → NAND2 → INV path, no cell boundary)
+.measure tran tpd_pos TRIG v(p0) VAL='VDD/2' RISE=1 TD=4ns
++                     TARG v(is_pos) VAL='VDD/2' RISE=1
+
+* tpd_zero: p1 0→1 at t=10ns → is_zero rises (INV → NAND2 → INV path)
+.measure tran tpd_zero TRIG v(p1) VAL='VDD/2' RISE=1 TD=9ns
++                      TARG v(is_zero) VAL='VDD/2' RISE=1
+
+* tpd_neg: p1 1→0 at t=15ns (p0 already 0) → is_neg rises via NOR2 PUN
+.measure tran tpd_neg TRIG v(p1) VAL='VDD/2' FALL=1 TD=14ns
++                     TARG v(is_neg) VAL='VDD/2' RISE=1
+
+* Average power (compare directly with t_class.spice: 1.95 µW)
+.measure tran power_avg AVG par('(-v(VDD)*i(Vvdd))') FROM=0ns TO=30ns
+
+* ── Output ───────────────────────────────────────────────────────────────────
+.print tran v(p0) v(p1) v(is_neg) v(is_zero) v(is_pos)
+.control
+  run
+  plot v(p0) v(p1) v(is_neg) v(is_zero) v(is_pos)
+  echo "--- T_CLASS_CUSTOM vs baseline ---"
+  echo "Baseline: tpd_neg=22.7ps  tpd_pos=36.1ps  tpd_zero=60.7ps  power=1.95uW"
+  echo "Custom:"
+  print tpd_neg tpd_zero tpd_pos power_avg
+.endc
+
+.end
