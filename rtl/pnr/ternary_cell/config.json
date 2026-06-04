@@ -1,0 +1,14 @@
+{
+    "DESIGN_NAME": "ternary_cell_top",
+    "VERILOG_FILES": "dir::src/*.sv",
+    "CLOCK_PORT": "clk",
+    "CLOCK_NET": "ref::$CLOCK_PORT",
+    "pdk::sky130*": {
+        "FP_CORE_UTIL": 55,
+        "PL_TARGET_DENSITY": 0.6,
+        "FP_PDN_SKIPTRIM": true,
+        "scl::sky130_fd_sc_hd": {
+            "CLOCK_PERIOD": 4.0
+        }
+    }
+}
