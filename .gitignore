@@ -30,3 +30,7 @@ Thumbs.db
 # RTL
 rtl/sim/build/
 rtl/spice/*.out
+
+# ASM build artifacts
+asm/*.o
+asm/test_propkernel

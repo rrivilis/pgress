@@ -1,10 +1,16 @@
 /*
  * test_propkernel.c — witness tests for the SSE2 ternary propagation kernel.
  *
+ * An independent implementation of the ternary propagation algebra using packed 
+ * two-bit planes and SSE2 logical operations (PAND, POR, PXOR, PMOVMSKB). 
+ * The kernel does not depend on the Rust runtime, dep counters, e-graph implementation, or compiled-region infrastructure. 
+ * It serves as a machine-level witness that the ternary reduction semantics and regional quiescence predicate 
+ * can be expressed directly as bitplane operations.
+ *
  * Each test initialises a region as packed bitplanes, invokes the asm kernels,
- * and asserts the result.  The chain-propagation witness at the end shows a
+ * and asserts the result. The chain-propagation witness at the end shows a
  * region transitioning from non-quiescent to quiescent through successive
- * MeetAll-driven Pos propagation steps — no Rust, no dep graph, no ownership.
+ * MeetAll-driven Pos propagation steps.
  *
  * Build:  see Makefile  (nasm + gcc, Linux / WSL)
  * Run:    ./test_propkernel
