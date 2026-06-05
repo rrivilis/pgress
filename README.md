@@ -321,10 +321,21 @@ pgress/
 │   │   ├── t_cell.spice / t_dff.spice / t_zero.spice / t_zero_icg.spice
 │   │   ├── t_region_icg.spice
 │   │   └── run_spice.sh
-│   └── sim/             — Verilator simulation
-│       ├── run_verilator.sh
-│       ├── run_topology.sh
-│       └── build/               — generated Verilator output (not checked in)
+│   ├── sim/             — Verilator simulation
+│   │   ├── run_verilator.sh
+│   │   ├── run_topology.sh
+│   │   └── build/               — generated Verilator output (not checked in)
+│   ├── pnr/             — OpenLane P&R configs and setup (sky130_fd_sc_hd)
+│   │   ├── setup_openlane.sh        — stage RTL + configs into ~/OpenLane/designs/
+│   │   ├── ternary_cell/            — N=8 MeetAll standalone; 80×80 µm die
+│   │   ├── ternary_region/          — K=8 region with ICG; headline P&R target
+│   │   └── meetall_500/             — N=500 flat MeetAll; 1000×1000 µm die
+│   └── pdn/             — OpenLane P&R GDSII visual certificates (sky130_fd_sc_hd)
+│       ├── ternary_cell_top.png   — N=8 MeetAll; 80×80 µm die; physical locality cert
+│       ├── meetall_500_1.png      — N=500 MeetAll; 1000×1000 µm die; IO ring + OR reduction tree
+│       ├── meetall_500_2.png      — N=500 MeetAll; cell-level view; dfxtp_4 output register
+│       ├── ternary-region3.png    — K=8 region; ICG latch (dlxtn_1) at 0.4 µm; quiescence net to GATE_N
+│       └── ternary-region4.png    — K=8 region; semantic workflow cluster: dlxtn_1 + a21oi_1 + xnor2_1 + dlygate4sd3_1
 ├── asm/                 — x86-64 SSE2 bitplane kernels (machine-level semantics witness)
 │   ├── ternary_propkernel.S — meetall_sse2, joinany_sse2, region_quiescent
 │   ├── test_propkernel.c    — 26 witness tests; chain propagation quiescence proof

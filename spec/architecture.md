@@ -148,6 +148,8 @@ The **domain** (partition) reaches quiescence when the propagation engine's work
 
 ### RTL implementation: `ternary_region.sv`
 
+> Physical P&R results including die dimensions, placed cell identities, ICG cluster coordinates, and STA closure notes are all in [benchmarks.md § Physical implementation](benchmarks.md#physical-implementation--openlane-pr-on-sky130_fd_sc_hd). Visual certificates are in `rtl/pdn/`.
+
 The two-bit `{p1, p0}` cell encoding maps directly onto standard-cell synthesis:
 
 | `{p1, p0}` | Value | Semantic |
